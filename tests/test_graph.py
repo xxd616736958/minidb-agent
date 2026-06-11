@@ -6,9 +6,15 @@ from agent.state import AgentState, TaskStep
 from agent.edges.routes import (
     route_after_llm,
     route_after_planner,
+    route_after_start,
+    route_after_intent_validator,
+    route_after_clarification,
     route_after_tools,
     route_after_error_handler,
     END,
+    INTENT_ANALYZER,
+    CLARIFICATION_GATE,
+    WORKFLOW_PLANNER,
     LLM_REASON,
     HUMAN_APPROVAL,
     EXECUTE_TOOLS,
@@ -123,6 +129,38 @@ class TestRouting:
         """Error → error_handler."""
         state = self._make_state(error="Something went wrong")
         assert route_after_llm(state) == ERROR_HANDLER
+
+    def test_route_after_start_enters_intent_analyzer(self):
+        """New turns should start with task understanding."""
+        state = self._make_state()
+        assert route_after_start(state) == INTENT_ANALYZER
+
+    def test_route_after_start_resumes_human_approval(self):
+        """Approval resumes still bypass task understanding."""
+        state = self._make_state(human_interrupt_pending=True)
+        assert route_after_start(state) == HUMAN_APPROVAL
+
+    def test_route_after_intent_validator_clarifies_when_needed(self):
+        """Missing slots should route to clarification."""
+        state = self._make_state(
+            current_intent={
+                "requires_clarification": True,
+            }
+        )
+        assert route_after_intent_validator(state) == CLARIFICATION_GATE
+
+    def test_route_after_clarification_stops_when_pending(self):
+        """Pending clarification should end the current turn."""
+        state = self._make_state(
+            pending_clarification={
+                "id": "1",
+                "questions": ["Which environment?"],
+                "missing_slots": ["target_environment"],
+                "reason": "missing environment",
+                "status": "pending",
+            }
+        )
+        assert route_after_clarification(state) == END
 
     def test_route_after_planner_no_error(self):
         """No error → memory_compactor."""

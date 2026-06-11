@@ -28,9 +28,12 @@ from cli.approval import prompt_human_approval
 from cli.display import (
     console,
     print_banner,
+    print_clarification,
+    print_db_plan,
     print_divider,
     print_error,
     print_goodbye,
+    print_intent,
     print_plan,
     print_session_info,
     print_tool_call,
@@ -244,9 +247,23 @@ class AgentRepl:
                 continue
 
             if node_name == "task_planner":
+                db_plan = output.get("db_task_plan") if isinstance(output, dict) else None
                 plan = output.get("plan") if isinstance(output, dict) else None
-                if plan:
+                if db_plan:
+                    print_db_plan(db_plan)
+                elif plan:
                     print_plan(plan)
+
+            elif node_name == "intent_validator":
+                intent = output.get("current_intent") if isinstance(output, dict) else None
+                if intent:
+                    print_intent(intent)
+
+            elif node_name == "clarification_gate":
+                request = output.get("pending_clarification") if isinstance(output, dict) else None
+                if request:
+                    print_clarification(request)
+                self._process_messages(output.get("messages", []))
 
             elif node_name == "llm_reason":
                 self._process_messages(output.get("messages", []))

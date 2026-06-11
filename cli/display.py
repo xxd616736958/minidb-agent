@@ -111,6 +111,71 @@ def print_plan(plan_text: str):
     console.print(Markdown(plan_text))
 
 
+def print_db_plan(plan: dict[str, Any]):
+    """Display a structured database task plan."""
+    if not plan:
+        return
+
+    table = Table(title="Database Task Plan", show_header=True, padding=(0, 1))
+    table.add_column("#", style="dim", width=3)
+    table.add_column("Step")
+    table.add_column("Phase", style="cyan")
+    table.add_column("Risk")
+    table.add_column("Policy")
+    table.add_column("Approval")
+
+    for idx, step in enumerate(plan.get("steps", []), start=1):
+        approval = "yes" if step.get("requires_approval") else "no"
+        table.add_row(
+            str(idx),
+            str(step.get("description", ""))[:70],
+            str(step.get("phase", "")),
+            str(step.get("risk_level", "")),
+            str(step.get("tool_policy", "")),
+            approval,
+        )
+    console.print(table)
+
+
+def print_intent(intent: dict[str, Any]):
+    """Display the agent's structured task understanding."""
+    if not intent:
+        return
+
+    table = Table(title="Task Understanding", show_header=False, padding=(0, 2))
+    table.add_column(style="dim")
+    table.add_column(style="cyan")
+    table.add_row("Domain", str(intent.get("domain", "unknown")))
+    table.add_row("Intent", str(intent.get("primary_intent", "unknown")))
+    table.add_row("Risk", str(intent.get("risk_level", "unknown")))
+    table.add_row("Workflow", str(intent.get("suggested_workflow", "unknown")))
+    goal = str(intent.get("goal") or intent.get("user_language_summary") or "")
+    if goal:
+        table.add_row("Goal", goal[:160])
+    missing = intent.get("missing_slots") or []
+    if missing:
+        table.add_row("Missing", ", ".join(str(item) for item in missing))
+    console.print(table)
+
+
+def print_clarification(request: dict[str, Any]):
+    """Display a structured clarification request."""
+    if not request:
+        return
+
+    questions = request.get("questions") or []
+    if not questions:
+        return
+    body = "\n".join(f"{idx}. {question}" for idx, question in enumerate(questions, start=1))
+    panel = Panel(
+        body,
+        title="Need Clarification",
+        border_style="yellow",
+        padding=(1, 1),
+    )
+    console.print(panel)
+
+
 def print_session_info(session_id: str, model: str, tools_count: int):
     """Display session information."""
     table = Table(show_header=False, box=None, padding=(0, 4))

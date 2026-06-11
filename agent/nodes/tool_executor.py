@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from datetime import datetime, timezone
 
 from agent.state import AgentState
 from tools.registry import registry
@@ -91,9 +92,20 @@ def execute_tools(state: AgentState) -> dict[str, Any]:
             task["result"] = tool_results[-1] if tool_results else ""
         task_stack[current_idx] = task
 
+    db_task_plan = state.get("db_task_plan")
+    if db_task_plan and current_idx < len(db_task_plan.get("steps", [])):
+        db_task_plan = dict(db_task_plan)
+        plan_steps = [dict(step) for step in db_task_plan.get("steps", [])]
+        if current_idx < len(plan_steps):
+            plan_steps[current_idx]["status"] = task_stack[current_idx].get("status", "completed")
+            plan_steps[current_idx]["result"] = task_stack[current_idx].get("result")
+        db_task_plan["steps"] = plan_steps
+        db_task_plan["updated_at"] = datetime.now(timezone.utc).isoformat()
+
     return {
         "messages": new_messages,
         "tool_call_results": tool_results,
         "task_stack": task_stack,
+        "db_task_plan": db_task_plan,
         "step_count": state.get("step_count", 0) + 1,
     }

@@ -16,6 +16,10 @@ logger = logging.getLogger(__name__)
 
 # ── Node name constants ───────────────────────────────────────
 
+INTENT_ANALYZER = "intent_analyzer"
+INTENT_VALIDATOR = "intent_validator"
+CLARIFICATION_GATE = "clarification_gate"
+WORKFLOW_PLANNER = "workflow_planner"
 TASK_PLANNER = "task_planner"
 MEMORY_COMPACTOR = "memory_compactor"
 LLM_REASON = "llm_reason"
@@ -25,15 +29,58 @@ ERROR_HANDLER = "error_handler"
 END = "__end__"
 
 
-def route_after_start(state: AgentState) -> Literal["task_planner", "llm_reason"]:
-    """Route from START: plan complex tasks, or go directly to LLM.
+def route_after_start(
+    state: AgentState,
+) -> Literal["intent_analyzer", "human_approval"]:
+    """Route from START through task understanding before planning.
 
-    Always routes to task_planner first, which internally decides
-    whether decomposition is needed.
+    Resuming human approval still goes directly to the approval node.
     """
     # Check if we're resuming from a breakpoint
     if state.get("human_interrupt_pending"):
         return HUMAN_APPROVAL
+    return INTENT_ANALYZER
+
+
+def route_after_intent_analyzer(
+    state: AgentState,
+) -> Literal["intent_validator", "error_handler"]:
+    """After intent analysis: validate or handle errors."""
+    if state.get("error"):
+        return ERROR_HANDLER
+    return INTENT_VALIDATOR
+
+
+def route_after_intent_validator(
+    state: AgentState,
+) -> Literal["clarification_gate", "workflow_planner", "error_handler"]:
+    """After intent validation: ask clarification when required."""
+    if state.get("error"):
+        return ERROR_HANDLER
+    intent = state.get("current_intent")
+    if intent and intent.get("requires_clarification"):
+        return CLARIFICATION_GATE
+    return WORKFLOW_PLANNER
+
+
+def route_after_clarification(
+    state: AgentState,
+) -> Literal["workflow_planner", "error_handler", END]:
+    """Stop the current turn when waiting for user clarification."""
+    if state.get("error"):
+        return ERROR_HANDLER
+    pending = state.get("pending_clarification")
+    if pending and pending.get("status") == "pending":
+        return END
+    return WORKFLOW_PLANNER
+
+
+def route_after_workflow_planner(
+    state: AgentState,
+) -> Literal["task_planner", "error_handler"]:
+    """After workflow selection: enter task planning."""
+    if state.get("error"):
+        return ERROR_HANDLER
     return TASK_PLANNER
 
 

@@ -49,6 +49,8 @@ software engineering tasks by reasoning step by step and using tools when needed
 ## Current Environment
 - Working directory: {cwd}
 - Platform: {platform}
+
+{intent_context}
 """
 
 
@@ -68,7 +70,46 @@ def build_system_prompt(state: dict[str, Any]) -> str:
         memory_context=memory_context,
         cwd=os.getcwd(),
         platform=platform.platform(),
+        intent_context=_build_intent_prompt_context(state),
     ) + "\n" + WORKING_MEMORY_SYSTEM_PROMPT
+
+
+def _build_intent_prompt_context(state: dict[str, Any]) -> str:
+    """Build PostgreSQL task-understanding context for the reasoning model."""
+    intent = state.get("current_intent")
+    if not intent:
+        return ""
+
+    lines = [
+        "## Current Task Understanding",
+        f"- Domain: {intent.get('domain')}",
+        f"- Primary intent: {intent.get('primary_intent')}",
+        f"- Goal: {intent.get('goal')}",
+        f"- Operation nature: {intent.get('operation_nature')}",
+        f"- Risk level: {intent.get('risk_level')}",
+        f"- Target environment: {intent.get('target_environment')}",
+        f"- Suggested workflow: {intent.get('suggested_workflow')}",
+        f"- Requires approval: {intent.get('requires_approval')}",
+        f"- Requires rollback plan: {intent.get('requires_rollback_plan')}",
+    ]
+    missing = intent.get("missing_slots") or []
+    if missing:
+        lines.append(f"- Missing information: {', '.join(missing)}")
+    evidence = intent.get("evidence_needed") or []
+    if evidence:
+        lines.append(f"- Evidence to collect before conclusions: {', '.join(evidence)}")
+    constraints = intent.get("constraints") or []
+    if constraints:
+        lines.append(f"- User constraints: {', '.join(constraints)}")
+
+    lines.extend(
+        [
+            "",
+            "For PostgreSQL work, prefer read-only observation before making recommendations.",
+            "Do not execute schema/data/permission changes unless the plan includes approval and rollback handling.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _get_llm():
@@ -175,6 +216,12 @@ def llm_reason(state: AgentState) -> dict[str, Any]:
             f"\n## Current Task ({current_idx + 1}/{len(task_stack)})\n"
             f"**Task**: {current_task.get('description', 'N/A')}\n"
             f"**Status**: {current_task.get('status', 'pending')}\n"
+            f"**Phase**: {current_task.get('phase', 'n/a')}\n"
+            f"**Risk**: {current_task.get('risk_level', 'n/a')}\n"
+            f"**Tool policy**: {current_task.get('tool_policy', 'n/a')}\n"
+            f"**Requires approval**: {current_task.get('requires_approval', False)}\n"
+            f"**Requires rollback plan**: {current_task.get('requires_rollback_plan', False)}\n"
+            f"**Success criteria**: {', '.join(current_task.get('success_criteria', []) or ['complete the step'])}\n"
             f"Please complete this subtask before moving to the next one."
         )
         messages.append(SystemMessage(content=task_msg))

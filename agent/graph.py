@@ -19,6 +19,10 @@ from langgraph.graph import END, START, StateGraph
 
 from agent.config import get_settings
 from agent.edges.routes import (
+    INTENT_ANALYZER,
+    INTENT_VALIDATOR,
+    CLARIFICATION_GATE,
+    WORKFLOW_PLANNER,
     LLM_REASON,
     EXECUTE_TOOLS,
     HUMAN_APPROVAL,
@@ -26,15 +30,25 @@ from agent.edges.routes import (
     MEMORY_COMPACTOR,
     TASK_PLANNER,
     route_after_approval,
+    route_after_clarification,
     route_after_compactor,
     route_after_error_handler,
+    route_after_intent_analyzer,
+    route_after_intent_validator,
     route_after_llm,
     route_after_planner,
     route_after_start,
     route_after_tools,
+    route_after_workflow_planner,
 )
 from agent.nodes.error_handler import error_handler
 from agent.nodes.human_approval import human_approval
+from agent.nodes.intent import (
+    clarification_gate,
+    intent_analyzer,
+    intent_validator,
+    workflow_planner,
+)
 from agent.nodes.llm_node import llm_reason
 from agent.nodes.memory_compactor import memory_compactor
 from agent.nodes.task_planner import task_planner
@@ -72,6 +86,10 @@ def build_graph() -> StateGraph:
     builder = StateGraph(AgentState)
 
     # Register nodes
+    builder.add_node(INTENT_ANALYZER, intent_analyzer)
+    builder.add_node(INTENT_VALIDATOR, intent_validator)
+    builder.add_node(CLARIFICATION_GATE, clarification_gate)
+    builder.add_node(WORKFLOW_PLANNER, workflow_planner)
     builder.add_node(TASK_PLANNER, task_planner)
     builder.add_node(MEMORY_COMPACTOR, memory_compactor)
     builder.add_node(LLM_REASON, llm_reason)
@@ -81,14 +99,51 @@ def build_graph() -> StateGraph:
 
     # ── Add edges ────────────────────────────────────────
 
-    # Entry: route through planner
+    # Entry: understand intent before planning
     builder.add_conditional_edges(
         START,
         route_after_start,
         {
-            "task_planner": TASK_PLANNER,
-            "llm_reason": LLM_REASON,
+            "intent_analyzer": INTENT_ANALYZER,
             "human_approval": HUMAN_APPROVAL,
+        },
+    )
+
+    builder.add_conditional_edges(
+        INTENT_ANALYZER,
+        route_after_intent_analyzer,
+        {
+            "intent_validator": INTENT_VALIDATOR,
+            "error_handler": ERROR_HANDLER,
+        },
+    )
+
+    builder.add_conditional_edges(
+        INTENT_VALIDATOR,
+        route_after_intent_validator,
+        {
+            "clarification_gate": CLARIFICATION_GATE,
+            "workflow_planner": WORKFLOW_PLANNER,
+            "error_handler": ERROR_HANDLER,
+        },
+    )
+
+    builder.add_conditional_edges(
+        CLARIFICATION_GATE,
+        route_after_clarification,
+        {
+            "workflow_planner": WORKFLOW_PLANNER,
+            "error_handler": ERROR_HANDLER,
+            END: END,
+        },
+    )
+
+    builder.add_conditional_edges(
+        WORKFLOW_PLANNER,
+        route_after_workflow_planner,
+        {
+            "task_planner": TASK_PLANNER,
+            "error_handler": ERROR_HANDLER,
         },
     )
 
