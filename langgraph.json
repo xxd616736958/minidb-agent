@@ -1,0 +1,22 @@
+{
+  "$schema": "https://langgra.ph/schema.json",
+  "dependencies": [
+    "langchain-openai",
+    "langgraph-checkpoint-sqlite",
+    "langgraph-checkpoint-postgres",
+    "."
+  ],
+  "graphs": {
+    "agent": "./agent/graph.py:graph"
+  },
+  "env": ".env",
+  "python_version": "3.11",
+  "http": {
+    "app": "./server/app.py:app"
+  },
+  "checkpointer": {
+    "serde": {
+      "pickle_fallback": true
+    }
+  }
+}

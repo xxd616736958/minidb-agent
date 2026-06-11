@@ -1,0 +1,78 @@
+# Docker Compose — Production Deployment
+#
+# Start:  docker compose up -d
+# Stop:   docker compose down
+# Logs:   docker compose logs -f langgraph-server
+#
+# Requirements:
+#   - .env file with valid API keys
+#   - Docker Engine 24+
+
+version: "3.8"
+
+services:
+  # ── LangGraph Server ──────────────────────────────────
+  langgraph-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zuixiaoagent-server
+    ports:
+      - "${SERVER_PORT:-2024}:2024"
+    environment:
+      # LLM
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4o}
+      - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0}
+      - LLM_MAX_TOKENS=${LLM_MAX_TOKENS:-4096}
+      # LangSmith
+      - LANGSMITH_TRACING=${LANGSMITH_TRACING:-true}
+      - LANGSMITH_API_KEY=${LANGSMITH_API_KEY}
+      - LANGSMITH_PROJECT=${LANGSMITH_PROJECT:-zuixiaoagent}
+      - LANGSMITH_ENDPOINT=${LANGSMITH_ENDPOINT:-https://api.smith.langchain.com}
+      # Database (PostgreSQL)
+      - POSTGRES_URI=postgresql://agent:agent_password@postgres:5432/agent_memory
+      # Agent Config
+      - MAX_RETRIES=${MAX_RETRIES:-3}
+      - NODE_TIMEOUT_SECONDS=${NODE_TIMEOUT_SECONDS:-60}
+      - MEMORY_WINDOW_TOKENS=${MEMORY_WINDOW_TOKENS:-8000}
+      - MEMORY_COMPACT_THRESHOLD=${MEMORY_COMPACT_THRESHOLD:-12000}
+      # Auth
+      - AGENT_API_KEY=${AGENT_API_KEY:-}
+      # Logging
+      - AGENT_LOG_LEVEL=${AGENT_LOG_LEVEL:-INFO}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:2024/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ── PostgreSQL ────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: zuixiaoagent-postgres
+    environment:
+      - POSTGRES_USER=agent
+      - POSTGRES_PASSWORD=agent_password
+      - POSTGRES_DB=agent_memory
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent -d agent_memory"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+    driver: local
