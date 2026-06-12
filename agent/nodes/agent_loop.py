@@ -10,7 +10,8 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, ToolMessage
 
-from agent.state import AgentState, DBObservation, TaskStep, VerificationResult
+from agent.context import build_context_snapshot, build_result_digest, build_step_context_packet
+from agent.state import AgentState, DBObservation, ResultDigest, TaskStep, VerificationResult
 
 logger = logging.getLogger(__name__)
 
@@ -101,11 +102,17 @@ def step_scheduler(state: AgentState) -> dict[str, Any]:
         step["status"] = "running"
         steps[idx] = step
         update = _sync_plan_and_stack(state, steps, idx, "running")
+        next_state = {
+            **state,
+            **update,
+            "current_step_id": step["id"],
+        }
         update.update(
             {
                 "current_step_id": step["id"],
                 "loop_status": "running",
                 "policy_violation": None,
+                "step_context": build_step_context_packet(next_state),
             }
         )
         return update
@@ -199,7 +206,8 @@ def tool_policy_gate(state: AgentState) -> dict[str, Any]:
         return {}
 
     current_step = _current_step_from_state(state)
-    policy = (current_step or {}).get("tool_policy", "no_tools")
+    packet = state.get("step_context") or build_step_context_packet(state)
+    policy = str((packet or {}).get("tool_policy") or (current_step or {}).get("tool_policy", "no_tools"))
     violation = _policy_violation_message(policy, tool_calls)
 
     if policy == "write_tools_after_approval":
@@ -232,7 +240,9 @@ def tool_policy_gate(state: AgentState) -> dict[str, Any]:
             "policy": policy,
             "message": violation,
             "blocked_tools": tool_names,
+            "blocked_actions": (packet or {}).get("blocked_actions", []),
         },
+        "step_context": packet,
         "loop_status": "blocked" if policy == "write_tools_after_approval" else "running",
     }
 
@@ -259,6 +269,7 @@ def normalize_observation(state: AgentState) -> dict[str, Any]:
     step = _current_step_from_state(state)
     step_id = (step or {}).get("id") or state.get("current_step_id") or ""
     observations: list[DBObservation] = []
+    digests: list[ResultDigest] = []
     seen_tool_call_ids = {
         obs.get("payload", {}).get("tool_call_id")
         for obs in state.get("db_observations", [])
@@ -273,24 +284,36 @@ def normalize_observation(state: AgentState) -> dict[str, Any]:
             continue
         content = str(getattr(msg, "content", ""))
         name = str(getattr(msg, "name", "tool"))
-        observations.append(
-            {
-                "id": f"obs-{uuid.uuid4().hex[:12]}",
-                "step_id": step_id,
-                "type": _observation_type(name, content),
-                "source_tool": name,
-                "summary": content[:300],
-                "payload": {
-                    "content": content,
-                    "tool_call_id": tool_call_id,
-                },
-                "created_at": _now_iso(),
-            }
-        )
+        observation: DBObservation = {
+            "id": f"obs-{uuid.uuid4().hex[:12]}",
+            "step_id": step_id,
+            "type": _observation_type(name, content),
+            "source_tool": name,
+            "summary": content[:300],
+            "payload": {
+                "content": content,
+                "tool_call_id": tool_call_id,
+            },
+            "created_at": _now_iso(),
+        }
+        observations.append(observation)
+        digest = build_result_digest(observation)
+        if digest:
+            digests.append(digest)
 
     if not observations:
         return {}
-    return {"db_observations": observations}
+
+    snapshot_state = {
+        **state,
+        "db_observations": [*state.get("db_observations", []), *observations],
+        "result_digests": [*state.get("result_digests", []), *digests],
+    }
+    return {
+        "db_observations": observations,
+        "result_digests": digests,
+        "context_snapshots": [build_context_snapshot(snapshot_state)],
+    }
 
 
 def verify_step(state: AgentState) -> dict[str, Any]:
@@ -342,11 +365,18 @@ def verify_step(state: AgentState) -> dict[str, Any]:
         current_idx,
         "failed" if status in {"failed", "blocked"} else "running",
     )
+    snapshot_state = {
+        **state,
+        **update,
+        "verification_results": [*state.get("verification_results", []), result],
+    }
     update.update(
         {
             "verification_results": [result],
             "loop_status": "blocked" if status in {"failed", "blocked"} else "running",
             "replan_trigger": "verification_blocked" if status in {"failed", "blocked"} else None,
+            "step_context": build_step_context_packet(snapshot_state),
+            "context_snapshots": [build_context_snapshot(snapshot_state)],
         }
     )
     return update

@@ -193,6 +193,67 @@ class VerificationResult(TypedDict):
     created_at: str
 
 
+class StepContextPacket(TypedDict):
+    """Current-step context packet injected into LLM and policy gates."""
+
+    step_id: str
+    phase: str
+    description: str
+    risk_level: str
+    tool_policy: str
+    success_criteria: list[str]
+    user_constraints: list[str]
+    relevant_observations: list[DBObservation]
+    relevant_approvals: list[ApprovalDecision]
+    relevant_verifications: list[VerificationResult]
+    allowed_actions: list[str]
+    blocked_actions: list[str]
+    missing_context: list[str]
+
+
+class DBWorkingSet(TypedDict):
+    """Database objects and metadata currently relevant to the task."""
+
+    target_environment: str
+    target_database: Optional[str]
+    schemas: list[str]
+    tables: list[str]
+    columns: dict[str, list[str]]
+    indexes: dict[str, list[str]]
+    known_queries: list[dict[str, Any]]
+    row_counts: dict[str, int]
+    statistics_refs: list[str]
+    last_refreshed_at: str
+
+
+class ResultDigest(TypedDict):
+    """Safe digest for large query results."""
+
+    observation_id: str
+    row_count: int
+    column_names: list[str]
+    column_types: dict[str, str]
+    sample_rows: list[dict[str, Any]]
+    aggregates: dict[str, Any]
+    truncation_applied: bool
+    sensitive_fields_masked: list[str]
+
+
+class ContextSnapshot(TypedDict):
+    """Recoverable state snapshot for long-running database tasks."""
+
+    intent_id: str
+    plan_id: str
+    current_step_id: Optional[str]
+    user_constraints: list[str]
+    observation_ids: list[str]
+    approval_ids: list[str]
+    verification_ids: list[str]
+    db_working_set_ref: Optional[str]
+    replan_trigger: Optional[str]
+    created_at: str
+
+
 class AgentState(TypedDict):
     """Complete agent state — the single data structure flowing through the graph.
 
@@ -233,6 +294,12 @@ class AgentState(TypedDict):
     verification_results: NotRequired[Annotated[list[VerificationResult], operator.add]]
     pending_approval: NotRequired[Optional[ApprovalDecision]]
     policy_violation: NotRequired[Optional[dict[str, Any]]]
+    step_context: NotRequired[Optional[StepContextPacket]]
+    db_working_set: NotRequired[Optional[DBWorkingSet]]
+    result_digests: NotRequired[Annotated[list[ResultDigest], operator.add]]
+    context_snapshots: NotRequired[Annotated[list[ContextSnapshot], operator.add]]
+    user_constraints: NotRequired[list[str]]
+    context_token_budget: NotRequired[int]
 
     # Human-readable plan summary injected into system prompt.
     plan: Optional[str]

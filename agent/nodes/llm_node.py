@@ -15,6 +15,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, SystemMessage
 
 from agent.config import get_settings
+from agent.context import build_context_snapshot, build_db_working_set, build_prompt_context
 from agent.llm_factory import create_llm_with_tools
 from agent.state import AgentState
 from memory.manager import MemoryManager
@@ -46,11 +47,11 @@ software engineering tasks by reasoning step by step and using tools when needed
 
 {memory_context}
 
+{database_context}
+
 ## Current Environment
 - Working directory: {cwd}
 - Platform: {platform}
-
-{intent_context}
 """
 
 
@@ -65,51 +66,14 @@ def build_system_prompt(state: dict[str, Any]) -> str:
     manager = MemoryManager(max_window_tokens=settings.memory_window_tokens)
 
     memory_context = manager.build_context(state)
+    database_context, _ = build_prompt_context(state)
 
     return SYSTEM_PROMPT_BASE.format(
         memory_context=memory_context,
+        database_context=database_context,
         cwd=os.getcwd(),
         platform=platform.platform(),
-        intent_context=_build_intent_prompt_context(state),
     ) + "\n" + WORKING_MEMORY_SYSTEM_PROMPT
-
-
-def _build_intent_prompt_context(state: dict[str, Any]) -> str:
-    """Build PostgreSQL task-understanding context for the reasoning model."""
-    intent = state.get("current_intent")
-    if not intent:
-        return ""
-
-    lines = [
-        "## Current Task Understanding",
-        f"- Domain: {intent.get('domain')}",
-        f"- Primary intent: {intent.get('primary_intent')}",
-        f"- Goal: {intent.get('goal')}",
-        f"- Operation nature: {intent.get('operation_nature')}",
-        f"- Risk level: {intent.get('risk_level')}",
-        f"- Target environment: {intent.get('target_environment')}",
-        f"- Suggested workflow: {intent.get('suggested_workflow')}",
-        f"- Requires approval: {intent.get('requires_approval')}",
-        f"- Requires rollback plan: {intent.get('requires_rollback_plan')}",
-    ]
-    missing = intent.get("missing_slots") or []
-    if missing:
-        lines.append(f"- Missing information: {', '.join(missing)}")
-    evidence = intent.get("evidence_needed") or []
-    if evidence:
-        lines.append(f"- Evidence to collect before conclusions: {', '.join(evidence)}")
-    constraints = intent.get("constraints") or []
-    if constraints:
-        lines.append(f"- User constraints: {', '.join(constraints)}")
-
-    lines.extend(
-        [
-            "",
-            "For PostgreSQL work, prefer read-only observation before making recommendations.",
-            "Do not execute schema/data/permission changes unless the plan includes approval and rollback handling.",
-        ]
-    )
-    return "\n".join(lines)
 
 
 def _get_llm():
@@ -207,24 +171,10 @@ def llm_reason(state: AgentState) -> dict[str, Any]:
     else:
         messages.insert(0, SystemMessage(content=system_content))
 
-    # Inject task context if executing a plan
-    task_stack = state.get("task_stack", [])
-    current_idx = state.get("current_task_index", 0)
-    if task_stack and current_idx < len(task_stack):
-        current_task = task_stack[current_idx]
-        task_msg = (
-            f"\n## Current Task ({current_idx + 1}/{len(task_stack)})\n"
-            f"**Task**: {current_task.get('description', 'N/A')}\n"
-            f"**Status**: {current_task.get('status', 'pending')}\n"
-            f"**Phase**: {current_task.get('phase', 'n/a')}\n"
-            f"**Risk**: {current_task.get('risk_level', 'n/a')}\n"
-            f"**Tool policy**: {current_task.get('tool_policy', 'n/a')}\n"
-            f"**Requires approval**: {current_task.get('requires_approval', False)}\n"
-            f"**Requires rollback plan**: {current_task.get('requires_rollback_plan', False)}\n"
-            f"**Success criteria**: {', '.join(current_task.get('success_criteria', []) or ['complete the step'])}\n"
-            f"Please complete this subtask before moving to the next one."
-        )
-        messages.append(SystemMessage(content=task_msg))
+    step_context = None
+    db_working_set = build_db_working_set(state)
+    context_snapshot = build_context_snapshot({**state, "db_working_set": db_working_set})
+    _, step_context = build_prompt_context({**state, "db_working_set": db_working_set})
 
     # Invoke LLM
     try:
@@ -247,6 +197,9 @@ def llm_reason(state: AgentState) -> dict[str, Any]:
     return {
         "messages": [response],
         "step_count": state.get("step_count", 0) + 1,
+        "step_context": step_context,
+        "db_working_set": db_working_set,
+        "context_snapshots": [context_snapshot],
         "tool_calls_pending": (
             [
                 {"name": tc["name"], "args": tc["args"], "id": tc["id"]}
