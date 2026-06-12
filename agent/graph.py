@@ -219,6 +219,7 @@ def build_graph() -> StateGraph:
             "human_approval": HUMAN_APPROVAL,
             "llm_reason": LLM_REASON,
             "error_handler": ERROR_HANDLER,
+            END: END,
         },
     )
 

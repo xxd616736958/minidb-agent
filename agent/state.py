@@ -397,6 +397,104 @@ class ReplayPolicy(TypedDict):
     requires_new_approval: bool
 
 
+class SecurityPolicyDecision(TypedDict):
+    """Decision emitted by the safety guardrail policy engine."""
+
+    id: str
+    scope: Literal[
+        "tool_visibility",
+        "tool_call",
+        "sql_execution",
+        "workspace_access",
+        "output_handling",
+        "state_replay",
+    ]
+    subject: str
+    decision: Literal["allow", "deny", "require_approval", "require_clarification"]
+    risk_level: Literal["low", "medium", "high", "critical"]
+    reasons: list[str]
+    matched_rules: list[str]
+    approval_payload: Optional[dict[str, Any]]
+    created_at: str
+
+
+class SQLSafetyReport(TypedDict):
+    """Structured safety report for SQL text before execution."""
+
+    sql_hash: str
+    normalized_sql_preview: str
+    classification: Literal[
+        "read_only",
+        "diagnostic",
+        "data_change",
+        "schema_change",
+        "permission_change",
+        "maintenance",
+        "transaction_control",
+        "unsafe",
+        "unknown",
+    ]
+    contains_multiple_statements: bool
+    contains_dangerous_constructs: list[str]
+    target_objects: list[dict[str, Any]]
+    requires_approval: bool
+    requires_rollback_plan: bool
+    requires_backup_check: bool
+    can_run_in_readonly_transaction: bool
+    risk_level: Literal["low", "medium", "high", "critical"]
+    denial_reason: Optional[str]
+
+
+class ApprovalBinding(TypedDict):
+    """Precise authorization boundary for one approval decision."""
+
+    approval_id: str
+    step_id: str
+    tool_name: str
+    target_environment: str
+    target_database: Optional[str]
+    sql_hash: Optional[str]
+    impact_summary: str
+    rollback_summary: str
+    verification_criteria: list[str]
+    expires_at: Optional[str]
+
+
+class OutputSafetyPolicy(TypedDict):
+    """Rules for model-safe tool output handling."""
+
+    max_rows: int
+    max_chars: int
+    mask_sensitive_fields: bool
+    sensitive_field_patterns: list[str]
+    allow_raw_result_in_context: bool
+    allow_raw_result_in_memory: bool
+    artifact_required_for_large_output: bool
+
+
+class SafetyAuditRecord(TypedDict):
+    """Auditable record for one safety-relevant decision."""
+
+    id: str
+    event_type: Literal[
+        "tool_visible",
+        "tool_hidden",
+        "tool_allowed",
+        "tool_denied",
+        "approval_requested",
+        "approval_resolved",
+        "sql_allowed",
+        "sql_denied",
+        "output_masked",
+        "replay_blocked",
+    ]
+    step_id: Optional[str]
+    tool_name: Optional[str]
+    decision_id: Optional[str]
+    summary: str
+    created_at: str
+
+
 class MemoryRecord(TypedDict):
     """Safe, scoped long-term memory record."""
 
@@ -635,6 +733,11 @@ class AgentState(TypedDict):
     task_workspace: NotRequired[Optional[TaskWorkspace]]
     artifact_records: NotRequired[Annotated[list[ArtifactRecord], operator.add]]
     runtime_policy: NotRequired[Optional[RuntimePolicy]]
+    security_policy_decisions: NotRequired[Annotated[list[SecurityPolicyDecision], operator.add]]
+    sql_safety_reports: NotRequired[Annotated[list[SQLSafetyReport], operator.add]]
+    approval_bindings: NotRequired[Annotated[list[ApprovalBinding], operator.add]]
+    output_safety_policy: NotRequired[Optional[OutputSafetyPolicy]]
+    safety_audit_records: NotRequired[Annotated[list[SafetyAuditRecord], operator.add]]
     state_schema_version: NotRequired[int]
     state_metadata: NotRequired[StateMetadata]
     db_task_runtime: NotRequired[Optional[DBTaskRuntimeState]]

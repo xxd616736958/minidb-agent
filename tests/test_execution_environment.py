@@ -101,6 +101,17 @@ def test_database_environment_profile_is_safe_and_production_aware(monkeypatch):
     assert "secret" not in str(profile)
 
 
+def test_database_environment_profile_treats_unknown_as_read_only(monkeypatch):
+    monkeypatch.delenv("POSTGRES_TARGET_ENV", raising=False)
+    profile = build_database_environment_profile("postgresql://user:secret@db.example.com:5432/app")
+    runtime_policy = build_runtime_policy(profile)
+
+    assert profile["environment_name"] == "unknown"
+    assert profile["access_mode"] == "read_only"
+    assert profile["allow_write_tools"] is False
+    assert runtime_policy["allow_database_writes"] is False
+
+
 def test_database_environment_manager_exposes_session_policies(monkeypatch):
     monkeypatch.setenv("POSTGRES_TARGET_ENV", "dev")
     profile = build_database_environment_profile("postgresql://user:secret@dev.example.com:5432/app")

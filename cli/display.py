@@ -211,6 +211,8 @@ def print_loop_status(label: str, payload: dict[str, Any]):
             )
     elif label == "tool_policy_gate":
         _print_state_runtime(payload)
+        _print_safety(payload)
+        _print_pending_approval(payload)
         decisions = payload.get("tool_policy_decisions") or []
         for decision in decisions:
             console.print(
@@ -226,6 +228,7 @@ def print_loop_status(label: str, payload: dict[str, Any]):
     elif label == "execute_tools":
         _print_state_runtime(payload)
         _print_execution_environment(payload)
+        _print_safety(payload)
         artifacts = payload.get("artifact_records") or []
         for artifact in artifacts:
             console.print(
@@ -286,6 +289,42 @@ def _print_execution_environment(payload: dict[str, Any]) -> None:
         "[dim]Execution env:[/dim] "
         f"[cyan]{env_name}/{database}[/cyan] @ {host} "
         f"[dim]access={access} task={task_id} workspace={root}[/dim]"
+    )
+
+
+def _print_safety(payload: dict[str, Any]) -> None:
+    decisions = payload.get("security_policy_decisions") or []
+    audits = payload.get("safety_audit_records") or []
+    if decisions:
+        latest = decisions[-1]
+        reasons = latest.get("reasons") or []
+        reason = str(reasons[0])[:100] if reasons else str(latest.get("decision"))
+        console.print(
+            "[dim]Safety:[/dim] "
+            f"[cyan]{latest.get('scope')}[/cyan] "
+            f"{latest.get('subject')} -> {latest.get('decision')} "
+            f"[dim]risk={latest.get('risk_level')} {reason}[/dim]"
+        )
+    if audits:
+        latest_audit = audits[-1]
+        console.print(
+            "[dim]Audit:[/dim] "
+            f"[cyan]{latest_audit.get('event_type')}[/cyan] "
+            f"{str(latest_audit.get('summary', ''))[:100]}"
+        )
+
+
+def _print_pending_approval(payload: dict[str, Any]) -> None:
+    approval = payload.get("pending_approval")
+    if not approval:
+        return
+    sql_hash = approval.get("sql_hash") or "no-sql-hash"
+    env = approval.get("target_environment") or "unknown"
+    impact = str(approval.get("impact_summary") or "")[:100]
+    console.print(
+        "[dim]Pending approval:[/dim] "
+        f"[cyan]{approval.get('id')}[/cyan] "
+        f"[dim]env={env} risk={approval.get('risk_level')} sql_hash={sql_hash} {impact}[/dim]"
     )
 
 

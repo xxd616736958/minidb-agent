@@ -428,6 +428,54 @@ def build_prompt_context(state: AgentState) -> tuple[str, StepContextPacket | No
             )
         )
 
+    security_decisions = state.get("security_policy_decisions", [])[-5:]
+    sql_reports = state.get("sql_safety_reports", [])[-3:]
+    output_policy = state.get("output_safety_policy")
+    pending_approval = state.get("pending_approval")
+    if security_decisions or sql_reports or output_policy or pending_approval:
+        sections.append(
+            "## Safety Guardrails\n"
+            + json.dumps(
+                {
+                    "pending_approval": {
+                        "id": pending_approval.get("id"),
+                        "step_id": pending_approval.get("step_id"),
+                        "status": pending_approval.get("status"),
+                        "risk_level": pending_approval.get("risk_level"),
+                        "target_environment": pending_approval.get("target_environment"),
+                        "sql_hash": pending_approval.get("sql_hash"),
+                    } if pending_approval else None,
+                    "recent_decisions": [
+                        {
+                            "scope": item.get("scope"),
+                            "subject": item.get("subject"),
+                            "decision": item.get("decision"),
+                            "risk_level": item.get("risk_level"),
+                            "reasons": item.get("reasons", [])[:2],
+                        }
+                        for item in security_decisions
+                    ],
+                    "recent_sql_reports": [
+                        {
+                            "sql_hash": item.get("sql_hash"),
+                            "classification": item.get("classification"),
+                            "risk_level": item.get("risk_level"),
+                            "requires_approval": item.get("requires_approval"),
+                            "denial_reason": item.get("denial_reason"),
+                        }
+                        for item in sql_reports
+                    ],
+                    "output_policy": {
+                        "max_rows": (output_policy or {}).get("max_rows"),
+                        "mask_sensitive_fields": (output_policy or {}).get("mask_sensitive_fields"),
+                        "allow_raw_result_in_context": (output_policy or {}).get("allow_raw_result_in_context"),
+                    } if output_policy else None,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+
     query = build_memory_query(state)
     memories = state.get("retrieved_memories")
     if memories is None:

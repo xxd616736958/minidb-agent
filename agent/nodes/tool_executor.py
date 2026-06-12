@@ -18,6 +18,7 @@ from langchain_core.messages import ToolMessage
 
 from agent.state import AgentState
 from execution.environment import ArtifactStore, ExecutionEnvironmentManager
+from safety.engine import SecurityPolicyEngine
 from state_management.manager import StateManager
 from state_management.validator import StateValidator
 from tools.postgres.results import loads_result
@@ -230,6 +231,24 @@ def execute_tools(state: AgentState) -> dict[str, Any]:
         if isinstance(msg, ToolMessage):
             structured_results.append(_tool_execution_result(msg, started_at, environment_summary))
 
+    safety_engine = SecurityPolicyEngine({**state, **environment_update})
+    output_safety_decisions = [
+        safety_engine.output_handling_decision(
+            tool_name=str(result.get("tool_name") or "tool"),
+            result=result,
+        )
+        for result in structured_results
+    ]
+    output_safety_audits = [
+        safety_engine.audit_for_decision(
+            decision,
+            step_id=state.get("current_step_id"),
+            tool_name=decision.get("subject"),
+        )
+        for decision in output_safety_decisions
+        if decision.get("matched_rules") and decision.get("matched_rules") != ["output.safe"]
+    ]
+
     artifact_records = [
         ArtifactStore(environment_update.get("task_workspace")).record(
             kind=_artifact_kind_for_result(result),
@@ -276,6 +295,9 @@ def execute_tools(state: AgentState) -> dict[str, Any]:
         "messages": new_messages,
         "tool_call_results": tool_results,
         "tool_execution_results": structured_results,
+        "security_policy_decisions": output_safety_decisions,
+        "safety_audit_records": output_safety_audits,
+        "output_safety_policy": safety_engine.default_output_policy(),
         "tool_invocation_records": _update_invocation_records(state, structured_results, artifact_records),
         "artifact_records": artifact_records,
         "replay_policies": replay_policies,

@@ -48,6 +48,26 @@ class StateValidator:
         if db_env.get("is_production") and runtime_policy.get("allow_database_writes"):
             errors.append("Production database environment has database writes enabled.")
             repair_actions.append("Set runtime_policy.allow_database_writes to false.")
+        if db_env.get("environment_name") == "unknown" and runtime_policy.get("allow_database_writes"):
+            errors.append("Unknown database environment has database writes enabled.")
+            repair_actions.append("Confirm target environment or keep runtime_policy.allow_database_writes false.")
+
+        for approval in state.get("approval_decisions", []):
+            if approval.get("status") != "approved":
+                continue
+            if approval.get("sql_preview") and not approval.get("sql_hash"):
+                errors.append(f"approved approval '{approval.get('id')}' has SQL preview but no sql_hash.")
+                repair_actions.append("Expire approval or bind it to a normalized SQL hash.")
+            if approval.get("risk_level") in {"high", "critical"} and not approval.get("rollback_summary"):
+                warnings.append(f"approved high-risk approval '{approval.get('id')}' has no rollback summary.")
+                repair_actions.append("Add rollback summary before executing write SQL.")
+
+        approved_ids = {approval.get("id") for approval in state.get("approval_decisions", []) if approval.get("status") == "approved"}
+        for binding in state.get("approval_bindings", []):
+            approval_id = binding.get("approval_id")
+            if approval_id and approval_id not in approved_ids:
+                errors.append(f"approval binding '{approval_id}' does not reference an approved decision.")
+                repair_actions.append("Remove stale approval binding or request approval again.")
 
         observed_tool_call_ids = {
             obs.get("payload", {}).get("tool_call_id")

@@ -28,6 +28,10 @@ class StateMigration:
             "result_digests": [],
             "context_snapshots": [],
             "tool_policy_decisions": [],
+            "security_policy_decisions": [],
+            "sql_safety_reports": [],
+            "approval_bindings": [],
+            "safety_audit_records": [],
             "tool_invocation_records": [],
             "tool_execution_results": [],
             "artifact_records": [],
@@ -43,6 +47,11 @@ class StateMigration:
             working_set.setdefault("source_observation_ids", [])
             working_set.setdefault("stale_reason", None)
             update["db_working_set"] = working_set
+
+        if "output_safety_policy" not in state:
+            from safety.engine import DEFAULT_OUTPUT_SAFETY_POLICY
+
+            update["output_safety_policy"] = dict(DEFAULT_OUTPUT_SAFETY_POLICY)
 
         migrated_state = {**state, **update}
         update["db_task_runtime"] = StateManager(migrated_state).build_runtime_state(migrated_state)

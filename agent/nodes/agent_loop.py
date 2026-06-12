@@ -18,9 +18,10 @@ from agent.context import (
 from agent.state import AgentState, DBObservation, ResultDigest, TaskStep, VerificationResult
 from execution.environment import ArtifactStore, ExecutionEnvironmentManager
 from memory.consolidator import consolidate_memories
+from safety.engine import SecurityPolicyEngine
 from state_management.manager import StateManager
 from state_management.validator import StateValidator
-from tools.policy import evaluate_tool_calls, make_invocation_record, tool_call_items
+from tools.policy import evaluate_tool_call_full, make_invocation_record, tool_call_items
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +140,39 @@ def _current_step_from_state(state: AgentState) -> TaskStep | None:
     return None
 
 
+def _pending_approval_from_blocked_decision(
+    blocked: list[dict[str, Any]],
+    current_step: TaskStep | None,
+    state: AgentState,
+) -> dict[str, Any] | None:
+    approval_decision = next(
+        (decision for decision in blocked if decision.get("decision") == "require_approval"),
+        None,
+    )
+    if not approval_decision:
+        return None
+    payload = approval_decision.get("approval_payload") or {}
+    db_env = state.get("database_environment") or {}
+    return {
+        "id": f"approval-{uuid.uuid4().hex[:12]}",
+        "step_id": str(payload.get("step_id") or (current_step or {}).get("id") or ""),
+        "status": "pending",
+        "risk_level": approval_decision.get("risk_level", "high"),
+        "target_environment": str(payload.get("target_environment") or db_env.get("environment_name") or "unknown"),
+        "sql_preview": payload.get("sql_preview"),
+        "sql_hash": payload.get("sql_hash"),
+        "impact_summary": payload.get("impact_summary"),
+        "rollback_summary": payload.get("rollback_summary"),
+        "verification_criteria": list(payload.get("verification_criteria") or (current_step or {}).get("success_criteria", [])),
+        "user_message": (
+            "Review and approve this database action before execution. "
+            f"Tool={payload.get('tool_name') or approval_decision.get('tool_name')}"
+        ),
+        "created_at": _now_iso(),
+        "resolved_at": None,
+    }
+
+
 def tool_policy_gate(state: AgentState) -> dict[str, Any]:
     """Enforce the current step's tool policy before execution."""
     messages = state.get("messages", [])
@@ -157,7 +191,20 @@ def tool_policy_gate(state: AgentState) -> dict[str, Any]:
     if current_step and packet and packet.get("step_id") != current_step.get("id"):
         packet = None
     packet = packet or build_step_context_packet(policy_state)
-    decisions = evaluate_tool_calls(policy_state, tool_calls)
+    full_decisions = [evaluate_tool_call_full(policy_state, call) for call in tool_calls]
+    decisions = [item[0] for item in full_decisions]
+    security_decisions = [item[1] for item in full_decisions]
+    sql_reports = [item[2] for item in full_decisions if item[2]]
+    approval_bindings = [item[3] for item in full_decisions if item[3]]
+    safety_engine = SecurityPolicyEngine(policy_state)
+    safety_audit_records = [
+        safety_engine.audit_for_decision(
+            security_decision,
+            step_id=(current_step or {}).get("id"),
+            tool_name=decision.get("tool_name"),
+        )
+        for decision, security_decision in zip(decisions, security_decisions)
+    ]
     blocked = [decision for decision in decisions if decision["decision"] in {"deny", "require_approval", "require_clarification"}]
     records = [
         make_invocation_record(
@@ -173,8 +220,13 @@ def tool_policy_gate(state: AgentState) -> dict[str, Any]:
         return {
             "policy_violation": None,
             "tool_policy_decisions": decisions,
+            "security_policy_decisions": security_decisions,
+            "sql_safety_reports": sql_reports,
+            "approval_bindings": approval_bindings,
+            "safety_audit_records": safety_audit_records,
             "tool_invocation_records": records,
             "step_context": packet,
+            "output_safety_policy": safety_engine.default_output_policy(),
             **environment_update,
             **StateManager({**policy_state, **environment_update}).runtime_update(last_node="tool_policy_gate"),
             **StateValidator({**policy_state, **environment_update}).validation_update(),
@@ -182,6 +234,7 @@ def tool_policy_gate(state: AgentState) -> dict[str, Any]:
 
     violation = blocked[0]["reason"]
     policy = str((packet or {}).get("tool_policy") or (current_step or {}).get("tool_policy", "no_tools"))
+    pending_approval = _pending_approval_from_blocked_decision(blocked, current_step, policy_state)
 
     logger.warning("Tool policy violation: %s", violation)
 
@@ -205,12 +258,27 @@ def tool_policy_gate(state: AgentState) -> dict[str, Any]:
             "decisions": blocked,
         },
         "tool_policy_decisions": decisions,
+        "security_policy_decisions": security_decisions,
+        "sql_safety_reports": sql_reports,
+        "approval_bindings": approval_bindings,
+        "safety_audit_records": safety_audit_records,
         "tool_invocation_records": records,
         "step_context": packet,
+        "output_safety_policy": safety_engine.default_output_policy(),
         **environment_update,
-        "loop_status": "blocked" if policy == "write_tools_after_approval" else "running",
+        "loop_status": "waiting_for_approval" if pending_approval else ("blocked" if policy == "write_tools_after_approval" else "running"),
     }
-    blocked_state = {**policy_state, **environment_update, **{"loop_status": "blocked" if policy == "write_tools_after_approval" else "running"}}
+    if pending_approval:
+        result["pending_approval"] = pending_approval
+        result["approval_decisions"] = [pending_approval]
+    blocked_state = {
+        **policy_state,
+        **environment_update,
+        **{
+            "loop_status": result["loop_status"],
+            "pending_approval": pending_approval or policy_state.get("pending_approval"),
+        },
+    }
     result.update(StateManager(blocked_state).runtime_update(last_node="tool_policy_gate"))
     result.update(StateValidator(blocked_state).validation_update())
     return result

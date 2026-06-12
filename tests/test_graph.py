@@ -172,6 +172,26 @@ class TestRouting:
         state = self._make_state(policy_violation={"message": "blocked"})
         assert route_after_policy_gate(state) == LLM_REASON
 
+    def test_route_after_policy_gate_stops_for_pending_approval(self):
+        state = self._make_state(
+            policy_violation={"message": "approval required"},
+            pending_approval={
+                "id": "approval-1",
+                "step_id": "execute",
+                "status": "pending",
+                "risk_level": "high",
+                "target_environment": "dev",
+                "sql_preview": "UPDATE orders SET status='done' WHERE id=1",
+                "sql_hash": "abc12345",
+                "impact_summary": "Update one row",
+                "rollback_summary": "Restore old status",
+                "user_message": None,
+                "created_at": "now",
+                "resolved_at": None,
+            },
+        )
+        assert route_after_policy_gate(state) == END
+
     def test_route_after_planner_no_error(self):
         """No error → memory_compactor."""
         state = self._make_state()

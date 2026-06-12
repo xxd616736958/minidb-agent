@@ -158,10 +158,13 @@ def route_after_llm(
 
 def route_after_policy_gate(
     state: AgentState,
-) -> Literal["human_approval", "llm_reason", "error_handler"]:
+) -> Literal["human_approval", "llm_reason", "error_handler", END]:
     """After tool policy gate: approve safe calls or ask LLM to adjust."""
     if state.get("error"):
         return ERROR_HANDLER
+    pending = state.get("pending_approval")
+    if pending and pending.get("status") == "pending":
+        return END
     if state.get("policy_violation"):
         return LLM_REASON
     return HUMAN_APPROVAL

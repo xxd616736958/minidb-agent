@@ -8,6 +8,7 @@ from typing import Any
 from langchain_core.tools import BaseTool
 
 from agent.state import AgentState, RegisteredToolSpec, TaskStep, ToolCapability
+from safety.engine import SecurityPolicyEngine
 
 
 PHASES = {"clarify", "observe", "diagnose", "propose", "approve", "execute", "verify", "report"}
@@ -209,6 +210,10 @@ def spec_allowed_for_state(spec: RegisteredToolSpec, state: AgentState) -> bool:
     if phase and spec["allowed_phases"] and phase not in spec["allowed_phases"]:
         return False
     if policy and spec["allowed_policies"] and policy not in spec["allowed_policies"]:
+        return False
+
+    visibility = SecurityPolicyEngine(state).evaluate_tool_visibility(spec)
+    if visibility["decision"] != "allow":
         return False
 
     if expected_tools and name not in expected_tools:

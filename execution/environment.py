@@ -98,7 +98,8 @@ def build_database_environment_profile(database_url: str | None = None) -> Datab
         env_name = _environment_from_text(url)
     env_name = env_name if env_name in {"local", "dev", "staging", "production"} else "unknown"
     is_production = env_name == "production"
-    access_mode = "read_only" if is_production else "write_after_approval"
+    is_unknown = env_name == "unknown"
+    access_mode = "read_only" if is_production or is_unknown else "write_after_approval"
     return {
         "environment_name": env_name,  # type: ignore[typeddict-item]
         "target_database": parsed.path.lstrip("/") if parsed and parsed.path else None,
@@ -109,8 +110,8 @@ def build_database_environment_profile(database_url: str | None = None) -> Datab
         "default_statement_timeout_ms": int(os.environ.get("POSTGRES_STATEMENT_TIMEOUT_MS", "30000")),
         "default_lock_timeout_ms": int(os.environ.get("POSTGRES_LOCK_TIMEOUT_MS", "5000")),
         "max_result_rows": int(os.environ.get("POSTGRES_MAX_RESULT_ROWS", "100")),
-        "allow_write_tools": not is_production,
-        "require_backup_check_for_writes": is_production,
+        "allow_write_tools": not (is_production or is_unknown),
+        "require_backup_check_for_writes": is_production or is_unknown,
         "credential_ref": "env:POSTGRES_TARGET_URL" if os.environ.get("POSTGRES_TARGET_URL") else "settings:POSTGRES_URI",
     }
 
