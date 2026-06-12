@@ -34,6 +34,18 @@ class FileWriteTool(AgentTool):
         "Warning: existing files will be overwritten."
     )
     args_schema: Type[BaseModel] = FileWriteInput
+    tool_domain: str = "filesystem"
+    operation_type: str = "documentation"
+    risk_level: str = "medium"
+    read_only: bool = False
+    destructive: bool = True
+    requires_approval: bool = False
+    allowed_phases: list[str] = ["execute", "report"]
+    allowed_policies: list[str] = ["write_tools_after_approval"]
+    output_type: str = "file_write_result"
+    result_sensitivity: str = "internal"
+    supports_parallel: bool = False
+    search_hint: str | None = "write local file content"
 
     def _run(self, path: str, content: str) -> str:
         file_path = Path(path).expanduser().resolve()

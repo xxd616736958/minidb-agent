@@ -2,7 +2,7 @@
 
 This node:
   1. Builds the system prompt with memory context + tool descriptions
-  2. Binds all registered tools to the LLM via bind_tools()
+  2. Binds the current step's visible tools to the LLM via bind_tools()
   3. Invokes the LLM with the full message history
   4. Returns the LLM response (may contain tool_calls)
 """
@@ -81,12 +81,6 @@ def build_system_prompt(state: dict[str, Any]) -> str:
     ) + "\n" + WORKING_MEMORY_SYSTEM_PROMPT
 
 
-def _get_llm():
-    """Create a configured LLM instance with tool binding via the shared factory."""
-    tools = registry.get_all()
-    return create_llm_with_tools(tools)
-
-
 def _sanitize_tool_call_messages(messages: list) -> list:
     """Strip orphaned tool_calls from AIMessages that have no matching ToolMessages.
 
@@ -144,22 +138,13 @@ def llm_reason(state: AgentState) -> dict[str, Any]:
     The LLM receives:
       - System prompt with full memory context + tool descriptions
       - Complete message history
-      - Bound tool definitions (via bind_tools)
+      - Dynamically allowed tool definitions (via bind_tools)
 
     Returns:
         Partial state with the new AIMessage appended.
     """
     settings = get_settings()
     logger.info(f"LLM reasoning step (session={state.get('session_id', '?')})")
-
-    try:
-        llm = _get_llm()
-    except Exception as e:
-        logger.error(f"Failed to create LLM: {e}")
-        return {
-            "error": f"LLM initialization failed: {e}",
-            "step_count": state.get("step_count", 0) + 1,
-        }
 
     # Build conversation
     messages = list(state.get("messages", []))
@@ -173,6 +158,15 @@ def llm_reason(state: AgentState) -> dict[str, Any]:
     db_working_set = build_db_working_set(state)
     retrieved_memories = retrieve_relevant_memories({**state, "db_working_set": db_working_set})
     enriched_state = {**state, "db_working_set": db_working_set, "retrieved_memories": retrieved_memories}
+    visible_tools, visible_specs = registry.get_for_state(enriched_state)
+    try:
+        llm = create_llm_with_tools(visible_tools)
+    except Exception as e:
+        logger.error(f"Failed to create LLM: {e}")
+        return {
+            "error": f"LLM initialization failed: {e}",
+            "step_count": state.get("step_count", 0) + 1,
+        }
     context_snapshot = build_context_snapshot(enriched_state)
     _, step_context = build_prompt_context(enriched_state)
 
@@ -208,6 +202,8 @@ def llm_reason(state: AgentState) -> dict[str, Any]:
         "step_context": step_context,
         "db_working_set": db_working_set,
         "retrieved_memories": retrieved_memories,
+        "available_tools": [tool.name for tool in visible_tools],
+        "available_tool_specs": visible_specs,
         "context_snapshots": [context_snapshot],
         "tool_calls_pending": (
             [

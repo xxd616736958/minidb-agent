@@ -46,6 +46,17 @@ class CodeSearchTool(AgentTool):
         "variable usages, or any text pattern in a codebase."
     )
     args_schema: Type[BaseModel] = CodeSearchInput
+    tool_domain: str = "code"
+    operation_type: str = "read_only"
+    risk_level: str = "low"
+    read_only: bool = True
+    destructive: bool = False
+    requires_approval: bool = False
+    allowed_phases: list[str] = ["observe", "diagnose", "verify", "report"]
+    allowed_policies: list[str] = ["read_only_tools", "write_tools_after_approval"]
+    output_type: str = "code_search_result"
+    result_sensitivity: str = "internal"
+    search_hint: str | None = "search code text patterns"
 
     def _run(
         self,

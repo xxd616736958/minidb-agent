@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -18,16 +17,9 @@ from agent.context import (
 )
 from agent.state import AgentState, DBObservation, ResultDigest, TaskStep, VerificationResult
 from memory.consolidator import consolidate_memories
+from tools.policy import evaluate_tool_calls, make_invocation_record, tool_call_items
 
 logger = logging.getLogger(__name__)
-
-
-WRITE_SQL_RE = re.compile(
-    r"\b(insert|update|delete|merge|alter|drop|truncate|create|grant|revoke|vacuum|reindex)\b",
-    re.IGNORECASE,
-)
-READ_SQL_RE = re.compile(r"\b(select|explain|show|with)\b", re.IGNORECASE)
-
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -137,88 +129,6 @@ def step_scheduler(state: AgentState) -> dict[str, Any]:
     }
 
 
-def _tool_call_items(msg: Any) -> list[dict[str, Any]]:
-    return list(getattr(msg, "tool_calls", None) or [])
-
-
-def _tool_args_text(tool_call: dict[str, Any]) -> str:
-    args = tool_call.get("args") or {}
-    if isinstance(args, dict):
-        return " ".join(str(value) for value in args.values())
-    return str(args)
-
-
-def _is_postgres_tool(tool_name: str) -> bool:
-    lowered = tool_name.lower()
-    return any(token in lowered for token in ("postgres", "postgresql", "sql", "database", "db"))
-
-
-def _is_write_call(tool_call: dict[str, Any]) -> bool:
-    name = str(tool_call.get("name", ""))
-    text = _tool_args_text(tool_call)
-    return _is_postgres_tool(name) and bool(WRITE_SQL_RE.search(text))
-
-
-def _is_read_call(tool_call: dict[str, Any]) -> bool:
-    name = str(tool_call.get("name", ""))
-    text = _tool_args_text(tool_call)
-    if not _is_postgres_tool(name):
-        return True
-    return bool(READ_SQL_RE.search(text)) and not bool(WRITE_SQL_RE.search(text))
-
-
-def _policy_violation_message(policy: str, tool_calls: list[dict[str, Any]]) -> str | None:
-    if not tool_calls:
-        return None
-
-    if policy == "no_tools":
-        return "Current plan step does not allow tool calls."
-
-    if policy == "read_only_tools":
-        write_calls = [call for call in tool_calls if _is_write_call(call)]
-        if write_calls:
-            names = ", ".join(str(call.get("name", "unknown")) for call in write_calls)
-            return f"Current plan step is read-only; blocked write-capable SQL call(s): {names}."
-        non_read = [call for call in tool_calls if not _is_read_call(call)]
-        if non_read:
-            names = ", ".join(str(call.get("name", "unknown")) for call in non_read)
-            return f"Current plan step allows only read-only database tools; blocked: {names}."
-
-    return None
-
-
-def _safety_memory_violation(state: AgentState, tool_calls: list[dict[str, Any]]) -> str | None:
-    """Apply retrieved SafetyMemory/prohibition records to concrete tool calls."""
-    write_calls = [call for call in tool_calls if _is_write_call(call)]
-    if not write_calls:
-        return None
-
-    memories = state.get("retrieved_memories")
-    if memories is None:
-        memories = retrieve_relevant_memories(state, limit=8)
-
-    for memory in memories:
-        if memory.get("kind") != "prohibition":
-            continue
-        text = f"{memory.get('summary', '')} {memory.get('payload', {})}".lower()
-        if (
-            "只读" in text
-            or "read-only" in text
-            or "read only" in text
-            or "不要执行" in text
-            or "禁止" in text
-        ):
-            return f"Long-term SafetyMemory prohibits write SQL: {memory.get('summary')}"
-
-        blocked_verbs = ("drop", "truncate", "delete", "update", "insert", "alter", "grant", "revoke")
-        for call in write_calls:
-            call_text = _tool_args_text(call).lower()
-            if any(verb in text and re.search(rf"\b{verb}\b", call_text, re.IGNORECASE) for verb in blocked_verbs):
-                return f"Long-term SafetyMemory blocks this SQL pattern: {memory.get('summary')}"
-
-    return None
-
-
 def _current_step_from_state(state: AgentState) -> TaskStep | None:
     steps = _plan_steps(state)
     step_id = state.get("current_step_id")
@@ -239,29 +149,37 @@ def tool_policy_gate(state: AgentState) -> dict[str, Any]:
         return {}
 
     last_msg = messages[-1]
-    tool_calls = _tool_call_items(last_msg)
+    tool_calls = tool_call_items(last_msg)
     if not tool_calls:
         return {}
 
     current_step = _current_step_from_state(state)
-    packet = state.get("step_context") or build_step_context_packet(state)
-    policy = str((packet or {}).get("tool_policy") or (current_step or {}).get("tool_policy", "no_tools"))
-    violation = _policy_violation_message(policy, tool_calls)
-    safety_violation = _safety_memory_violation(state, tool_calls)
-    if safety_violation:
-        violation = safety_violation
-
-    if policy == "write_tools_after_approval":
-        approved = any(
-            decision.get("step_id") == (current_step or {}).get("id")
-            and decision.get("status") == "approved"
-            for decision in state.get("approval_decisions", [])
+    packet = state.get("step_context")
+    if current_step and packet and packet.get("step_id") != current_step.get("id"):
+        packet = None
+    packet = packet or build_step_context_packet(state)
+    decisions = evaluate_tool_calls(state, tool_calls)
+    blocked = [decision for decision in decisions if decision["decision"] in {"deny", "require_approval", "require_clarification"}]
+    records = [
+        make_invocation_record(
+            state,
+            call,
+            decision,
+            status="denied" if decision["decision"] in {"deny", "require_clarification"} else "pending",
         )
-        if not violation and not approved and any(_is_write_call(call) for call in tool_calls):
-            violation = "Current write-capable PostgreSQL step requires explicit approval before execution."
+        for call, decision in zip(tool_calls, decisions)
+    ]
 
-    if not violation:
-        return {"policy_violation": None}
+    if not blocked:
+        return {
+            "policy_violation": None,
+            "tool_policy_decisions": decisions,
+            "tool_invocation_records": records,
+            "step_context": packet,
+        }
+
+    violation = blocked[0]["reason"]
+    policy = str((packet or {}).get("tool_policy") or (current_step or {}).get("tool_policy", "no_tools"))
 
     logger.warning("Tool policy violation: %s", violation)
 
@@ -282,7 +200,10 @@ def tool_policy_gate(state: AgentState) -> dict[str, Any]:
             "message": violation,
             "blocked_tools": tool_names,
             "blocked_actions": (packet or {}).get("blocked_actions", []),
+            "decisions": blocked,
         },
+        "tool_policy_decisions": decisions,
+        "tool_invocation_records": records,
         "step_context": packet,
         "loop_status": "blocked" if policy == "write_tools_after_approval" else "running",
     }
@@ -316,6 +237,31 @@ def normalize_observation(state: AgentState) -> dict[str, Any]:
         for obs in state.get("db_observations", [])
         if obs.get("payload", {}).get("tool_call_id")
     }
+
+    for result in state.get("tool_execution_results", []):
+        tool_call_id = result.get("tool_call_id")
+        if tool_call_id and tool_call_id in seen_tool_call_ids:
+            continue
+        observation: DBObservation = {
+            "id": f"obs-{uuid.uuid4().hex[:12]}",
+            "step_id": step_id,
+            "type": result.get("result_type", "tool_error"),
+            "source_tool": result.get("tool_name", "tool"),
+            "summary": result.get("summary", "")[:300],
+            "payload": {
+                **result.get("payload", {}),
+                "tool_call_id": tool_call_id,
+                "duration_ms": result.get("duration_ms"),
+                "success": result.get("success"),
+            },
+            "created_at": _now_iso(),
+        }
+        observations.append(observation)
+        if tool_call_id:
+            seen_tool_call_ids.add(tool_call_id)
+        digest = build_result_digest(observation)
+        if digest:
+            digests.append(digest)
 
     for msg in state.get("messages", []):
         if not isinstance(msg, ToolMessage):

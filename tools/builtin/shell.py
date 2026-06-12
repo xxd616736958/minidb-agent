@@ -74,6 +74,18 @@ class ShellTool(AgentTool):
     )
     args_schema: Type[BaseModel] = ShellInput
     tool_timeout: float = 60.0
+    tool_domain: str = "shell"
+    operation_type: str = "none"
+    risk_level: str = "high"
+    read_only: bool = False
+    destructive: bool = True
+    requires_approval: bool = True
+    allowed_phases: list[str] = ["execute", "verify"]
+    allowed_policies: list[str] = ["write_tools_after_approval"]
+    output_type: str = "shell_result"
+    result_sensitivity: str = "internal"
+    supports_parallel: bool = False
+    search_hint: str | None = "run local shell command"
 
     # ── Command classification (overridden from config at runtime) ──
     _whitelist: set[str] = set()

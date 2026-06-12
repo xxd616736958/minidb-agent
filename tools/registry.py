@@ -16,6 +16,9 @@ from typing import Optional
 
 from langchain_core.tools import BaseTool
 
+from agent.state import AgentState, RegisteredToolSpec
+from tools.catalog import ToolCatalog, build_tool_pool
+
 logger = logging.getLogger(__name__)
 
 
@@ -31,6 +34,7 @@ class SkillRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[str, BaseTool] = {}
+        self.catalog = ToolCatalog()
 
     # ── Discovery ─────────────────────────────────────────
 
@@ -85,6 +89,7 @@ class SkillRegistry:
 
                     if instance.name not in self._tools:
                         self._tools[instance.name] = instance
+                        self.catalog.register(instance, plugin_source=full_modname)
                         newly_registered.append(instance)
                         logger.info(
                             f"Registered tool: '{instance.name}' "
@@ -98,14 +103,21 @@ class SkillRegistry:
     def register(self, tool: BaseTool) -> None:
         """Manually register a tool instance."""
         self._tools[tool.name] = tool
+        self.catalog.register(tool)
         logger.info(f"Manually registered tool: '{tool.name}'")
 
     def unregister(self, name: str) -> bool:
         """Remove a tool by name. Returns True if it existed."""
         if name in self._tools:
             del self._tools[name]
+            self.catalog.unregister(name)
             return True
         return False
+
+    def clear(self) -> None:
+        """Remove all registered tools and catalog metadata."""
+        self._tools.clear()
+        self.catalog = ToolCatalog()
 
     # ── Access ────────────────────────────────────────────
 
@@ -113,9 +125,21 @@ class SkillRegistry:
         """Return all registered tools."""
         return list(self._tools.values())
 
+    def get_for_state(self, state: AgentState) -> tuple[list[BaseTool], list[RegisteredToolSpec]]:
+        """Return tools visible for the current AgentState and their specs."""
+        return build_tool_pool(state, self.get_all(), self.catalog)
+
     def get_by_name(self, name: str) -> Optional[BaseTool]:
         """Get a specific tool by its name."""
         return self._tools.get(name)
+
+    def get_spec(self, name: str) -> RegisteredToolSpec | None:
+        """Return policy metadata for a registered tool."""
+        return self.catalog.get(name)
+
+    def get_specs(self) -> list[RegisteredToolSpec]:
+        """Return metadata for all registered tools."""
+        return self.catalog.get_all()
 
     def get_names(self) -> list[str]:
         """Return list of registered tool names."""

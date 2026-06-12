@@ -13,6 +13,8 @@ import logging
 from typing import Any
 from datetime import datetime, timezone
 
+from langchain_core.messages import ToolMessage
+
 from agent.state import AgentState
 from tools.registry import registry
 
@@ -33,6 +35,72 @@ def _get_tool_node():
         _tool_node = ToolNode(tools)
         logger.debug(f"ToolNode initialized with {len(tools)} tools")
     return _tool_node
+
+
+def _result_type(tool_name: str, content: str) -> str:
+    lowered = f"{tool_name} {content}".lower()
+    if "policy_denied" in lowered or "blocked" in lowered:
+        return "policy_denied"
+    if "explain" in lowered:
+        return "explain_plan"
+    if "schema" in lowered:
+        return "schema_summary"
+    if "index" in lowered:
+        return "index_summary"
+    if "lock" in lowered:
+        return "lock_wait"
+    if "affected" in lowered or ("rows" in lowered and any(word in lowered for word in ("update", "delete", "insert"))):
+        return "affected_rows"
+    if "sqlstate" in lowered or "sql" in lowered and "error" in lowered:
+        return "sql_error"
+    if "error" in lowered or "exception" in lowered:
+        return "tool_error"
+    return "query_result"
+
+
+def _tool_execution_result(msg: ToolMessage, started_at: datetime) -> dict[str, Any]:
+    content = str(getattr(msg, "content", ""))
+    name = str(getattr(msg, "name", "tool"))
+    duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
+    result_type = _result_type(name, content)
+    success = result_type not in {"sql_error", "tool_error", "policy_denied"} and not content.lower().startswith("error")
+    return {
+        "tool_call_id": str(getattr(msg, "tool_call_id", "")),
+        "tool_name": name,
+        "success": success,
+        "result_type": result_type,
+        "summary": content[:300],
+        "payload": {"content": content},
+        "row_count": None,
+        "affected_rows": None,
+        "sqlstate": None,
+        "duration_ms": duration_ms,
+        "truncated": len(content) > 300,
+        "sensitive_fields_masked": [],
+    }
+
+
+def _update_invocation_records(state: AgentState, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not results:
+        return []
+    by_call_id = {result["tool_call_id"]: result for result in results}
+    updated = []
+    now = datetime.now(timezone.utc).isoformat()
+    for record in state.get("tool_invocation_records", []):
+        call_id = record.get("call_id")
+        if call_id not in by_call_id:
+            continue
+        result = by_call_id[call_id]
+        record = dict(record)
+        record["ended_at"] = now
+        record["status"] = "succeeded" if result.get("success") else "failed"
+        record["duration_ms"] = result.get("duration_ms")
+        record["result_ref"] = call_id
+        if not result.get("success"):
+            record["error_type"] = result.get("result_type")
+            record["error_message"] = result.get("summary")
+        updated.append(record)
+    return updated
 
 
 def execute_tools(state: AgentState) -> dict[str, Any]:
@@ -64,6 +132,7 @@ def execute_tools(state: AgentState) -> dict[str, Any]:
     )
 
     # Execute via LangGraph's ToolNode
+    started_at = datetime.now(timezone.utc)
     try:
         tool_node = _get_tool_node()
         result = tool_node.invoke({"messages": messages})
@@ -77,10 +146,13 @@ def execute_tools(state: AgentState) -> dict[str, Any]:
     # Extract results and format for logging
     new_messages = result.get("messages", [])
     tool_results: list[str] = []
+    structured_results: list[dict[str, Any]] = []
     for msg in new_messages:
         if hasattr(msg, "name") and hasattr(msg, "content"):
             content_preview = str(msg.content)[:200]
             tool_results.append(f"[{msg.name}]: {content_preview}")
+        if isinstance(msg, ToolMessage):
+            structured_results.append(_tool_execution_result(msg, started_at))
 
     # Keep task running; verify_step decides completion after observations are
     # normalized and checked against success criteria.
@@ -105,6 +177,8 @@ def execute_tools(state: AgentState) -> dict[str, Any]:
     return {
         "messages": new_messages,
         "tool_call_results": tool_results,
+        "tool_execution_results": structured_results,
+        "tool_invocation_records": _update_invocation_records(state, structured_results),
         "task_stack": task_stack,
         "db_task_plan": db_task_plan,
         "step_count": state.get("step_count", 0) + 1,

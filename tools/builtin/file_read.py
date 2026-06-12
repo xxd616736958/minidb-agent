@@ -38,6 +38,17 @@ class FileReadTool(AgentTool):
         "Use this to inspect file contents before editing."
     )
     args_schema: Type[BaseModel] = FileReadInput
+    tool_domain: str = "filesystem"
+    operation_type: str = "read_only"
+    risk_level: str = "low"
+    read_only: bool = True
+    destructive: bool = False
+    requires_approval: bool = False
+    allowed_phases: list[str] = ["observe", "diagnose", "verify", "report"]
+    allowed_policies: list[str] = ["read_only_tools", "write_tools_after_approval"]
+    output_type: str = "file_content"
+    result_sensitivity: str = "internal"
+    search_hint: str | None = "inspect local file contents"
 
     _MAX_LINES: int = 500
     _MAX_FILE_SIZE: int = 1_000_000  # 1MB

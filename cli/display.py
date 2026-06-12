@@ -201,6 +201,17 @@ def print_loop_status(label: str, payload: dict[str, Any]):
                 f"[dim]◦ Observation:[/dim] [cyan]{obs.get('type')}[/cyan] "
                 f"{str(obs.get('summary', ''))[:100]}"
             )
+    elif label == "tool_policy_gate":
+        decisions = payload.get("tool_policy_decisions") or []
+        for decision in decisions:
+            console.print(
+                f"[dim]◦ Tool policy:[/dim] [cyan]{decision.get('tool_name')}[/cyan] "
+                f"{decision.get('decision')} - {str(decision.get('reason', ''))[:100]}"
+            )
+    elif label == "llm_reason":
+        tools = payload.get("available_tools") or []
+        if tools:
+            console.print(f"[dim]Available tools:[/dim] {', '.join(str(tool) for tool in tools)}")
 
     written_memories = payload.get("memory_records_written") or []
     for memory in written_memories:

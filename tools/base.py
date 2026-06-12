@@ -39,6 +39,23 @@ class AgentTool(BaseTool):
     # Override in subclasses as needed.
     tool_timeout: float = Field(default=30.0, exclude=True)
 
+    # Capability metadata used by ToolCatalog and ToolCallPolicyGate.
+    tool_domain: str = Field(default="external", exclude=True)
+    operation_type: str = Field(default="none", exclude=True)
+    risk_level: str = Field(default="low", exclude=True)
+    read_only: bool = Field(default=True, exclude=True)
+    destructive: bool = Field(default=False, exclude=True)
+    requires_approval: bool = Field(default=False, exclude=True)
+    requires_transaction: bool = Field(default=False, exclude=True)
+    supports_parallel: bool = Field(default=True, exclude=True)
+    allowed_phases: list[str] = Field(default_factory=list, exclude=True)
+    allowed_policies: list[str] = Field(default_factory=list, exclude=True)
+    output_type: str = Field(default="tool_result", exclude=True)
+    result_sensitivity: str = Field(default="internal", exclude=True)
+    search_hint: str | None = Field(default=None, exclude=True)
+    defer_loading: bool = Field(default=False, exclude=True)
+    always_load: bool = Field(default=True, exclude=True)
+
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def __init_subclass__(cls, **kwargs: Any) -> None:

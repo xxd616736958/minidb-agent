@@ -255,7 +255,7 @@ class AgentRepl:
                 elif plan:
                     print_plan(plan)
 
-            elif node_name in ("step_scheduler", "normalize_observation", "verify_step"):
+            elif node_name in ("step_scheduler", "normalize_observation", "verify_step", "tool_policy_gate"):
                 if isinstance(output, dict):
                     print_loop_status(node_name, output)
 
@@ -271,6 +271,8 @@ class AgentRepl:
                 self._process_messages(output.get("messages", []))
 
             elif node_name == "llm_reason":
+                if isinstance(output, dict):
+                    print_loop_status(node_name, output)
                 self._process_messages(output.get("messages", []))
 
             elif node_name == "execute_tools":

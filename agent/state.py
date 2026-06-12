@@ -158,6 +158,7 @@ class DBObservation(TypedDict):
         "affected_rows",
         "sql_error",
         "tool_error",
+        "policy_denied",
     ]
     source_tool: str
     summary: str
@@ -311,6 +312,115 @@ class MemoryQuery(TypedDict):
     max_sensitivity: Literal["public", "internal", "sensitive"]
 
 
+class ToolCapability(TypedDict):
+    """Declared capability and safety metadata for one registered tool."""
+
+    domain: Literal[
+        "postgresql",
+        "filesystem",
+        "shell",
+        "code",
+        "memory",
+        "human",
+        "external",
+    ]
+    operation_type: Literal[
+        "read_only",
+        "diagnostic",
+        "schema_change",
+        "data_change",
+        "permission_change",
+        "backup_restore",
+        "documentation",
+        "none",
+    ]
+    risk_level: Literal["low", "medium", "high", "critical"]
+    read_only: bool
+    destructive: bool
+    requires_approval: bool
+    requires_transaction: bool
+    supports_parallel: bool
+
+
+class RegisteredToolSpec(TypedDict):
+    """Model-facing and policy-facing metadata for a registered tool."""
+
+    name: str
+    description: str
+    args_schema: dict[str, Any]
+    capability: ToolCapability
+    allowed_phases: list[str]
+    allowed_policies: list[str]
+    output_type: str
+    result_sensitivity: Literal["public", "internal", "sensitive", "secret"]
+    plugin_source: Optional[str]
+    enabled: bool
+    search_hint: Optional[str]
+    defer_loading: bool
+    always_load: bool
+
+
+class ToolCallPolicyDecision(TypedDict):
+    """Decision made before executing one tool call."""
+
+    call_id: str
+    tool_name: str
+    decision: Literal["allow", "deny", "require_approval", "require_clarification"]
+    reason: str
+    risk_level: str
+    approval_required: bool
+    approval_payload: Optional[dict[str, Any]]
+
+
+class ToolInvocationRecord(TypedDict):
+    """Auditable record for one tool invocation lifecycle."""
+
+    id: str
+    call_id: str
+    tool_name: str
+    step_id: Optional[str]
+    intent_id: Optional[str]
+    args_digest: dict[str, Any]
+    policy_decision: ToolCallPolicyDecision
+    approval_id: Optional[str]
+    started_at: str
+    ended_at: Optional[str]
+    status: Literal["pending", "running", "succeeded", "failed", "denied", "cancelled"]
+    duration_ms: Optional[int]
+    result_ref: Optional[str]
+    observation_ids: list[str]
+    error_type: Optional[str]
+    error_message: Optional[str]
+
+
+class ToolExecutionResult(TypedDict):
+    """Structured result normalized from a tool response."""
+
+    tool_call_id: str
+    tool_name: str
+    success: bool
+    result_type: Literal[
+        "query_result",
+        "explain_plan",
+        "schema_summary",
+        "index_summary",
+        "row_count_estimate",
+        "lock_wait",
+        "affected_rows",
+        "sql_error",
+        "tool_error",
+        "policy_denied",
+    ]
+    summary: str
+    payload: dict[str, Any]
+    row_count: Optional[int]
+    affected_rows: Optional[int]
+    sqlstate: Optional[str]
+    duration_ms: int
+    truncated: bool
+    sensitive_fields_masked: list[str]
+
+
 class AgentState(TypedDict):
     """Complete agent state — the single data structure flowing through the graph.
 
@@ -360,6 +470,11 @@ class AgentState(TypedDict):
     memory_candidates: NotRequired[Annotated[list[MemoryCandidate], operator.add]]
     retrieved_memories: NotRequired[list[MemoryRecord]]
     memory_records_written: NotRequired[Annotated[list[MemoryRecord], operator.add]]
+    available_tools: NotRequired[list[str]]
+    available_tool_specs: NotRequired[list[RegisteredToolSpec]]
+    tool_policy_decisions: NotRequired[Annotated[list[ToolCallPolicyDecision], operator.add]]
+    tool_invocation_records: NotRequired[Annotated[list[ToolInvocationRecord], operator.add]]
+    tool_execution_results: NotRequired[Annotated[list[ToolExecutionResult], operator.add]]
 
     # Human-readable plan summary injected into system prompt.
     plan: Optional[str]

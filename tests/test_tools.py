@@ -65,6 +65,8 @@ class TestSkillRegistry:
         assert "file_read" in names
         assert "file_write" in names
         assert "code_search" in names
+        assert registry.get_spec("file_read")["capability"]["read_only"] is True
+        assert registry.get_spec("shell_execute")["capability"]["requires_approval"] is True
 
     def test_get_by_name(self):
         """Should retrieve tools by name."""
@@ -80,6 +82,7 @@ class TestSkillRegistry:
         tool = ShellTool()
         registry.register(tool)
         assert registry.get_by_name("shell_execute") is not None
+        assert registry.get_spec("shell_execute")["capability"]["risk_level"] == "high"
         registry.unregister("shell_execute")
 
     def test_describe(self):
