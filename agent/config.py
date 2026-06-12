@@ -51,6 +51,49 @@ class AgentSettings(BaseSettings):
         default=4096, alias="LLM_MAX_TOKENS",
         description="Max output tokens per LLM call"
     )
+    model_routing_enabled: bool = Field(
+        default=True, alias="MODEL_ROUTING_ENABLED",
+        description="Enable task-aware model routing"
+    )
+    model_allowlist: str = Field(
+        default="deepseek-chat,deepseek-reasoner,gpt-4o,gpt-4o-mini",
+        alias="MODEL_ALLOWLIST",
+        description="Comma-separated list of model IDs allowed for routing"
+    )
+    default_model_alias: str = Field(
+        default="balanced", alias="DEFAULT_MODEL_ALIAS",
+        description="Default model alias for general tasks"
+    )
+    planning_model_alias: str = Field(
+        default="balanced", alias="PLANNING_MODEL_ALIAS",
+        description="Model alias for planning tasks"
+    )
+    tool_reasoning_model_alias: str = Field(
+        default="balanced", alias="TOOL_REASONING_MODEL_ALIAS",
+        description="Model alias for tool reasoning tasks"
+    )
+    safety_review_model_alias: str = Field(
+        default="review", alias="SAFETY_REVIEW_MODEL_ALIAS",
+        description="Model alias for high-risk safety review tasks"
+    )
+    report_model_alias: str = Field(
+        default="cheap", alias="REPORT_MODEL_ALIAS",
+        description="Model alias for report generation"
+    )
+    memory_model_alias: str = Field(
+        default="cheap", alias="MEMORY_MODEL_ALIAS",
+        description="Model alias for memory compaction"
+    )
+    model_forbid_silent_downshift_for_high_risk: bool = Field(
+        default=True,
+        alias="MODEL_FORBID_SILENT_DOWNSHIFT_FOR_HIGH_RISK",
+        description="Disallow silent model downshift for high-risk database tasks"
+    )
+    model_max_context_safety_ratio: float = Field(
+        default=0.8,
+        alias="MODEL_MAX_CONTEXT_SAFETY_RATIO",
+        description="Fraction of model context window considered safe for routing"
+    )
 
     # ── LangSmith ──────────────────────────────────────
     langsmith_tracing: bool = Field(
@@ -147,6 +190,11 @@ class AgentSettings(BaseSettings):
     def dangerous_commands_set(self) -> set[str]:
         """Parsed set of dangerous commands."""
         return {c.strip() for c in self.dangerous_commands.split(",") if c.strip()}
+
+    @property
+    def model_allowlist_set(self) -> set[str]:
+        """Parsed set of allowed model IDs."""
+        return {c.strip() for c in self.model_allowlist.split(",") if c.strip()}
 
     @property
     def auth_enabled(self) -> bool:

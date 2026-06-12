@@ -695,6 +695,66 @@ def build_prompt_context(state: AgentState) -> tuple[str, StepContextPacket | No
             )
         )
 
+    model_routes = state.get("model_routes", [])[-5:]
+    model_records = state.get("model_invocation_records", [])[-5:]
+    model_fallbacks = state.get("model_fallback_decisions", [])[-5:]
+    model_evals = state.get("model_evaluation_results", [])[-5:]
+    if model_routes or model_records or model_fallbacks or model_evals:
+        sections.append(
+            "## Model Abstraction and Routing\n"
+            + json.dumps(
+                {
+                    "recent_routes": [
+                        {
+                            "task": item.get("task"),
+                            "selected_model_id": item.get("selected_model_id"),
+                            "provider": item.get("provider"),
+                            "risk_level": item.get("risk_level"),
+                            "required_capabilities": item.get("required_capabilities", []),
+                            "tools_bound": item.get("tools_bound", []),
+                            "reason": item.get("reason"),
+                        }
+                        for item in model_routes
+                    ],
+                    "recent_invocations": [
+                        {
+                            "task": item.get("task"),
+                            "model_id": item.get("model_id"),
+                            "provider": item.get("provider"),
+                            "status": item.get("status"),
+                            "duration_ms": item.get("duration_ms"),
+                            "tools_bound": item.get("tools_bound", []),
+                            "error_type": item.get("error_type"),
+                            "cost_estimate": item.get("cost_estimate"),
+                        }
+                        for item in model_records
+                    ],
+                    "recent_fallbacks": [
+                        {
+                            "from_model_id": item.get("from_model_id"),
+                            "to_model_id": item.get("to_model_id"),
+                            "decision": item.get("decision"),
+                            "allowed_by_policy": item.get("allowed_by_policy"),
+                            "reason": item.get("reason"),
+                        }
+                        for item in model_fallbacks
+                    ],
+                    "recent_model_evaluations": [
+                        {
+                            "model_id": item.get("model_id"),
+                            "task": item.get("task"),
+                            "status": item.get("status"),
+                            "scores": item.get("scores", {}),
+                            "failure_modes": item.get("failure_modes", []),
+                        }
+                        for item in model_evals
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+
     quality_gates = state.get("quality_gates", [])[-5:]
     evaluation_results = state.get("evaluation_results", [])[-5:]
     replay_cases = state.get("replay_cases", [])[-3:]

@@ -57,6 +57,12 @@ class StateMigration:
             "delegation_failures": [],
             "delegation_evaluations": [],
             "agent_team_runs": [],
+            "model_profiles": [],
+            "model_routes": [],
+            "model_invocation_policies": [],
+            "model_invocation_records": [],
+            "model_fallback_decisions": [],
+            "model_evaluation_results": [],
         }
         for key, value in defaults.items():
             if key not in state:

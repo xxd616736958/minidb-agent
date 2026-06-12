@@ -173,6 +173,38 @@ class StateValidator:
                 warnings.append(f"delegation_evaluation '{evaluation.get('id')}' references missing result '{result_id}'.")
                 repair_actions.append("Regenerate delegation evaluation from current result.")
 
+        profiles = {
+            profile.get("model_id"): profile
+            for profile in state.get("model_profiles", [])
+        }
+        route_ids = {route.get("id") for route in state.get("model_routes", [])}
+        for route in state.get("model_routes", []):
+            model_id = route.get("selected_model_id")
+            profile = profiles.get(model_id)
+            if profiles and not profile:
+                errors.append(f"model route '{route.get('id')}' references unknown model '{model_id}'.")
+                repair_actions.append("Regenerate model route from current ModelRegistry.")
+            if route.get("task") == "tool_reasoning" and route.get("tools_bound") and profile and not profile.get("supports_tools"):
+                errors.append(f"model route '{route.get('id')}' binds tools to a model without tool support.")
+                repair_actions.append("Select a tool-capable model for tool_reasoning.")
+            policy = route.get("policy") or {}
+            if policy.get("require_review_model") and profile and profile.get("quality_tier") != "review":
+                errors.append(f"model route '{route.get('id')}' requires review model but selected '{model_id}'.")
+                repair_actions.append("Route high-risk model tasks to a review-tier model.")
+
+        for record in state.get("model_invocation_records", []):
+            route_id = record.get("route_id")
+            if route_id and route_ids and route_id not in route_ids:
+                warnings.append(f"model invocation '{record.get('id')}' references missing route '{route_id}'.")
+                repair_actions.append("Persist ModelRoute before ModelInvocationRecord.")
+            if record.get("task") == "tool_reasoning" and not record.get("tools_bound"):
+                warnings.append(f"tool_reasoning invocation '{record.get('id')}' has no bound tools.")
+
+        for fallback in state.get("model_fallback_decisions", []):
+            if fallback.get("decision") == "downshift" and not fallback.get("allowed_by_policy"):
+                errors.append(f"model fallback '{fallback.get('id')}' attempted disallowed downshift.")
+                repair_actions.append("Fail closed or request user input for high-risk model fallback.")
+
         return {
             "ok": not errors,
             "errors": errors,

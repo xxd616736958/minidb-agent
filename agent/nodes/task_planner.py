@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -17,11 +18,12 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from agent.config import get_settings
-from agent.llm_factory import create_llm_no_tools
+from agent.llm_factory import create_llm_for_task
 from agent.state import AgentState, DBTaskPlan, TaskStep
 from collaboration.manager import CollaborationManager
 from memory.schema import build_memory_query
 from memory.store import get_memory_store
+from models.routing import default_model_profiles, fallback_decision_for_error, finish_invocation_record
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +207,61 @@ def _parse_plan_output(raw: str) -> list[dict[str, Any]]:
     return []
 
 
+def _repair_plan_output(
+    raw: str,
+    state: AgentState,
+    model_update: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Repair malformed structured planner output with the same low-temperature route."""
+    try:
+        llm, route, record, profile = create_llm_for_task(
+            "planning",
+            state,
+            structured_output_schema="TaskStep[]",
+        )
+        started_at = time.monotonic()
+        response = llm.invoke([
+            SystemMessage(
+                content=(
+                    "Convert the malformed planner output into a valid JSON array of task objects. "
+                    "Preserve the task meaning, do not add explanations, and output JSON only."
+                )
+            ),
+            HumanMessage(content=raw),
+        ])
+        repaired_raw = str(response.content) if hasattr(response, "content") else str(response)
+        model_update.setdefault("model_routes", []).append(route)
+        model_update.setdefault("model_invocation_policies", []).append(route["policy"])
+        model_update.setdefault("model_invocation_records", []).append(
+            finish_invocation_record(
+                record,
+                status="succeeded",
+                started_at=started_at,
+                output_text=repaired_raw,
+                profile=profile,
+            )
+        )
+        return _parse_plan_output(repaired_raw)
+    except Exception as e:
+        logger.warning(f"Structured plan repair failed: {e}")
+        if "route" in locals() and "record" in locals() and "started_at" in locals():
+            model_update.setdefault("model_routes", []).append(route)
+            model_update.setdefault("model_invocation_policies", []).append(route["policy"])
+            model_update.setdefault("model_invocation_records", []).append(
+                finish_invocation_record(
+                    record,
+                    status="failed",
+                    started_at=started_at,
+                    error=e,
+                    profile=locals().get("profile"),
+                )
+            )
+            model_update.setdefault("model_fallback_decisions", []).append(
+                fallback_decision_for_error(route, record, e)
+            )
+        return []
+
+
 def _build_intent_context(state: AgentState) -> str:
     """Format structured task intent for the planner prompt."""
     intent = state.get("current_intent")
@@ -242,6 +299,16 @@ def _build_workflow_context(state: AgentState) -> str:
     for idx, step in enumerate(steps, start=1):
         lines.append(f"{idx}. {step}")
     return "\n".join(lines)
+
+
+def _render_planner_prompt(state: AgentState) -> str:
+    """Render the planner prompt without interpreting JSON examples as format fields."""
+    return (
+        TASK_PLANNER_SYSTEM_PROMPT
+        .replace("{memory_context}", _build_memory_context(state))
+        .replace("{intent_context}", _build_intent_context(state))
+        .replace("{workflow_context}", _build_workflow_context(state))
+    )
 
 
 def _build_memory_context(state: AgentState) -> str:
@@ -713,31 +780,54 @@ def task_planner(state: AgentState) -> dict[str, Any]:
     user_content = str(user_msg.content) if hasattr(user_msg, "content") else str(user_msg)
     logger.info(f"Task planner analyzing: {user_content[:100]}...")
 
-    settings = get_settings()
-
     try:
-        llm = create_llm_no_tools(
-            temperature=0.0,  # Deterministic planning
-            max_tokens=1024,
-        )
-
+        llm, route, record, profile = create_llm_for_task("planning", state, structured_output_schema="TaskStep[]")
+        started_at = time.monotonic()
         response = llm.invoke([
-            SystemMessage(content=TASK_PLANNER_SYSTEM_PROMPT.format(
-                memory_context=_build_memory_context(state),
-                intent_context=_build_intent_context(state),
-                workflow_context=_build_workflow_context(state),
-            )),
+            SystemMessage(content=_render_planner_prompt(state)),
             HumanMessage(content=user_content),
         ])
+        model_update = {
+            "model_routes": [route],
+            "model_invocation_policies": [route["policy"]],
+            "model_invocation_records": [
+                finish_invocation_record(
+                    record,
+                    status="succeeded",
+                    started_at=started_at,
+                    output_text=str(response.content) if hasattr(response, "content") else str(response),
+                    profile=profile,
+                )
+            ],
+        }
+        if not state.get("model_profiles"):
+            model_update["model_profiles"] = default_model_profiles()
     except Exception as e:
         logger.error(f"Task planner LLM call failed: {e}")
         # Non-fatal — agent can work without a plan
-        return {"plan": None, "task_stack": [], "current_task_index": 0}
+        failure_update = {"plan": None, "task_stack": [], "current_task_index": 0}
+        if "route" in locals() and "record" in locals() and "started_at" in locals():
+            failure_update.update(
+                {
+                    "model_routes": [route],
+                    "model_invocation_policies": [route["policy"]],
+                    "model_invocation_records": [
+                        finish_invocation_record(record, status="failed", started_at=started_at, error=e, profile=locals().get("profile"))
+                    ],
+                    "model_fallback_decisions": [fallback_decision_for_error(route, record, e)],
+                }
+            )
+            if not state.get("model_profiles"):
+                failure_update["model_profiles"] = default_model_profiles()
+        return failure_update
 
     raw = str(response.content) if hasattr(response, "content") else str(response)
     tasks_raw = _parse_plan_output(raw)
 
     intent = state.get("current_intent") or {}
+    if not tasks_raw and intent.get("domain") in {"postgresql", "documentation"}:
+        tasks_raw = _repair_plan_output(raw, state, model_update)
+
     if not tasks_raw and intent.get("domain") not in {"postgresql", "documentation"}:
         logger.info("Task planner: no decomposition needed (simple request)")
         return {
@@ -745,6 +835,7 @@ def task_planner(state: AgentState) -> dict[str, Any]:
             "task_stack": [],
             "db_task_plan": None,
             "current_task_index": 0,
+            **model_update,
         }
 
     if not tasks_raw:
@@ -762,5 +853,6 @@ def task_planner(state: AgentState) -> dict[str, Any]:
         "plan_history": [db_task_plan],
         "current_task_index": 0,
     }
+    update.update(model_update)
     update.update(CollaborationManager(state).plan_review_update(db_task_plan))
     return update

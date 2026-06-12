@@ -18,7 +18,7 @@ from agent.state import (
 )
 
 
-STATE_SCHEMA_VERSION = 6
+STATE_SCHEMA_VERSION = 7
 READONLY_REPLAYABLE_TOOLS = {
     "postgres_connection_check",
     "postgres_sql_classify",

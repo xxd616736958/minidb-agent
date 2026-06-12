@@ -295,6 +295,7 @@ def print_loop_status(label: str, payload: dict[str, Any]):
 
     _print_error_recovery(payload)
     _print_delegation(payload)
+    _print_model_routing(payload)
     _print_quality(payload)
     _print_collaboration_events(payload)
 
@@ -533,6 +534,35 @@ def _print_delegation(payload: dict[str, Any]) -> None:
             f"[cyan]{latest_team.get('status')}[/cyan] "
             f"tasks={len(latest_team.get('delegated_task_ids') or [])} "
             f"limit={latest_team.get('concurrency_limit')}"
+        )
+
+
+def _print_model_routing(payload: dict[str, Any]) -> None:
+    routes = payload.get("model_routes") or []
+    records = payload.get("model_invocation_records") or []
+    fallbacks = payload.get("model_fallback_decisions") or []
+    if routes:
+        latest = routes[-1]
+        console.print(
+            "[dim]Model route:[/dim] "
+            f"[cyan]{latest.get('task')}[/cyan] "
+            f"{latest.get('provider')}/{latest.get('selected_model_id')} "
+            f"[dim]risk={latest.get('risk_level')} tools={len(latest.get('tools_bound') or [])}[/dim]"
+        )
+    if records:
+        latest_record = records[-1]
+        console.print(
+            "[dim]Model call:[/dim] "
+            f"[cyan]{latest_record.get('status')}[/cyan] "
+            f"{latest_record.get('model_id')} "
+            f"[dim]{latest_record.get('duration_ms')}ms cost={latest_record.get('cost_estimate')}[/dim]"
+        )
+    if fallbacks:
+        latest_fallback = fallbacks[-1]
+        console.print(
+            "[dim]Model fallback:[/dim] "
+            f"[cyan]{latest_fallback.get('decision')}[/cyan] "
+            f"{latest_fallback.get('from_model_id')} -> {latest_fallback.get('to_model_id') or 'none'}"
         )
 
 

@@ -14,14 +14,16 @@ within the graph node, not a custom implementation.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from agent.llm_factory import create_llm_no_tools
+from agent.llm_factory import create_llm_for_task
 
 from agent.config import get_settings
 from agent.state import AgentState
+from models.routing import default_model_profiles, fallback_decision_for_error, finish_invocation_record
 
 logger = logging.getLogger(__name__)
 
@@ -105,11 +107,8 @@ def memory_compactor(state: AgentState) -> dict[str, Any]:
 
     # Call LLM for summarization (uses a smaller model when available)
     try:
-        llm = create_llm_no_tools(
-            temperature=0.0,
-            max_tokens=800,
-        )
-
+        llm, route, record, profile = create_llm_for_task("memory_compaction", state)
+        started_at = time.monotonic()
         summary_response = llm.invoke([
             SystemMessage(content=COMPACTION_SYSTEM_PROMPT),
             HumanMessage(content=summary_input),
@@ -117,6 +116,18 @@ def memory_compactor(state: AgentState) -> dict[str, Any]:
     except Exception as e:
         logger.error(f"Compaction summary failed: {e}")
         # Non-fatal — continue without compaction
+        if "route" in locals() and "record" in locals() and "started_at" in locals():
+            update = {
+                "model_routes": [route],
+                "model_invocation_policies": [route["policy"]],
+                "model_invocation_records": [
+                    finish_invocation_record(record, status="failed", started_at=started_at, error=e, profile=locals().get("profile"))
+                ],
+                "model_fallback_decisions": [fallback_decision_for_error(route, record, e)],
+            }
+            if not state.get("model_profiles"):
+                update["model_profiles"] = default_model_profiles()
+            return update
         return {}
 
     summary_text = str(summary_response.content) if hasattr(summary_response, "content") else str(summary_response)
@@ -142,4 +153,20 @@ def memory_compactor(state: AgentState) -> dict[str, Any]:
         f"~{saved} tokens saved"
     )
 
-    return {"messages": compacted}
+    update = {
+        "messages": compacted,
+        "model_routes": [route],
+        "model_invocation_policies": [route["policy"]],
+        "model_invocation_records": [
+            finish_invocation_record(
+                record,
+                status="succeeded",
+                started_at=started_at,
+                output_text=summary_text,
+                profile=profile,
+            )
+        ],
+    }
+    if not state.get("model_profiles"):
+        update["model_profiles"] = default_model_profiles()
+    return update

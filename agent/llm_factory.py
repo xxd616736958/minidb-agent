@@ -16,6 +16,13 @@ from typing import Optional
 from langchain_core.language_models import BaseChatModel
 
 from agent.config import get_settings
+from agent.state import AgentState, ModelInvocationRecord, ModelProfile, ModelRoute, ModelTask
+from models.provider import provider_adapter_for
+from models.routing import (
+    ModelRouter,
+    pending_invocation_record,
+    profile_for_route,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +32,8 @@ def create_llm(
     max_tokens: Optional[int] = None,
     timeout: Optional[float] = None,
     streaming: bool = False,
+    model_id: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> BaseChatModel:
     """Create an LLM instance based on the configured provider.
 
@@ -42,10 +51,15 @@ def create_llm(
     tokens = max_tokens if max_tokens is not None else settings.llm_max_tokens
     timeout_val = timeout if timeout is not None else settings.node_timeout_seconds
 
-    if settings.is_deepseek:
-        return _create_deepseek(temp, tokens, timeout_val, streaming)
+    provider_name = provider or ("deepseek" if settings.is_deepseek else "openai")
+    selected_model = model_id or settings.llm_model
+
+    if provider_name == "deepseek":
+        return _create_deepseek(temp, tokens, timeout_val, streaming, selected_model)
+    if provider_name == "openai":
+        return _create_openai(temp, tokens, timeout_val, streaming, selected_model)
     else:
-        return _create_openai(temp, tokens, timeout_val, streaming)
+        raise ValueError(f"Unsupported LLM provider: {provider_name}")
 
 
 def create_llm_no_tools(
@@ -94,6 +108,49 @@ def create_llm_with_tools(
     return llm
 
 
+def create_llm_for_task(
+    task: ModelTask,
+    state: AgentState | None = None,
+    tools: list | None = None,
+    structured_output_schema: str | None = None,
+    preferred_model: str | None = None,
+    delegated_task_id: str | None = None,
+) -> tuple[BaseChatModel, ModelRoute, ModelInvocationRecord, ModelProfile | None]:
+    """Route and create an LLM for a named model task.
+
+    Returns the LLM plus route/record/profile metadata so callers can append
+    model routing state after invocation succeeds or fails.
+    """
+    state = state or {}
+    router = ModelRouter(state)
+    route = router.route(
+        task,
+        tools=tools,
+        structured_output_schema=structured_output_schema,
+        delegated_task_id=delegated_task_id,
+        preferred_model=preferred_model,
+    )
+    profile = profile_for_route(route, state.get("model_profiles") or None)
+    if profile is None:
+        raise ValueError(f"No model profile found for route model={route['selected_model_id']}")
+    adapter = provider_adapter_for(route["provider"])
+    validation_errors = adapter.validate_model(profile, route)
+    if validation_errors:
+        raise ValueError(f"Model route validation failed: {', '.join(validation_errors)}")
+    policy = route["policy"]
+    llm = adapter.create_chat_model(route, profile)
+    if tools and policy["tools_allowed"]:
+        llm = llm.bind_tools(tools)
+        logger.debug(f"Bound {len(tools)} tools to routed LLM for task={task}")
+    record = pending_invocation_record(
+        route,
+        state=state,
+        structured_output_schema=structured_output_schema,
+        delegated_task_id=delegated_task_id,
+    )
+    return llm, route, record, profile
+
+
 # ── Private provider constructors ─────────────────────────────
 
 def _create_deepseek(
@@ -101,6 +158,7 @@ def _create_deepseek(
     max_tokens: int,
     timeout: float,
     streaming: bool,
+    model_id: Optional[str] = None,
 ) -> BaseChatModel:
     """Create a ChatDeepSeek instance."""
     from langchain_deepseek import ChatDeepSeek
@@ -114,12 +172,12 @@ def _create_deepseek(
         )
 
     logger.info(
-        f"Creating DeepSeek LLM: model={settings.llm_model}, "
+        f"Creating DeepSeek LLM: model={model_id or settings.llm_model}, "
         f"temperature={temperature}, max_tokens={max_tokens}"
     )
 
     return ChatDeepSeek(
-        model=settings.llm_model,
+        model=model_id or settings.llm_model,
         api_key=settings.deepseek_api_key,
         api_base=settings.deepseek_base_url,
         temperature=temperature,
@@ -134,6 +192,7 @@ def _create_openai(
     max_tokens: int,
     timeout: float,
     streaming: bool,
+    model_id: Optional[str] = None,
 ) -> BaseChatModel:
     """Create a ChatOpenAI instance."""
     from langchain_openai import ChatOpenAI
@@ -147,12 +206,12 @@ def _create_openai(
         )
 
     logger.info(
-        f"Creating OpenAI LLM: model={settings.llm_model}, "
+        f"Creating OpenAI LLM: model={model_id or settings.llm_model}, "
         f"temperature={temperature}, max_tokens={max_tokens}"
     )
 
     return ChatOpenAI(
-        model=settings.llm_model,
+        model=model_id or settings.llm_model,
         api_key=settings.openai_api_key,
         temperature=temperature,
         max_tokens=max_tokens,

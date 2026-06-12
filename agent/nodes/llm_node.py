@@ -10,6 +10,7 @@ This node:
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from langchain_core.messages import AIMessage, SystemMessage
@@ -21,11 +22,12 @@ from agent.context import (
     build_prompt_context,
     retrieve_relevant_memories,
 )
-from agent.llm_factory import create_llm_with_tools
+from agent.llm_factory import create_llm_for_task
 from agent.state import AgentState
 from memory.manager import MemoryManager
 from memory.working import WORKING_MEMORY_SYSTEM_PROMPT
 from execution.environment import ExecutionEnvironmentManager
+from models.routing import default_model_profiles, fallback_decision_for_error, finish_invocation_record
 from tools.registry import registry
 
 logger = logging.getLogger(__name__)
@@ -163,7 +165,7 @@ def llm_reason(state: AgentState) -> dict[str, Any]:
     enriched_state = {**state_with_environment, "db_working_set": db_working_set, "retrieved_memories": retrieved_memories}
     visible_tools, visible_specs = registry.get_for_state(enriched_state)
     try:
-        llm = create_llm_with_tools(visible_tools)
+        llm, route, record, profile = create_llm_for_task("tool_reasoning", enriched_state, tools=visible_tools)
     except Exception as e:
         logger.error(f"Failed to create LLM: {e}")
         return {
@@ -182,14 +184,24 @@ def llm_reason(state: AgentState) -> dict[str, Any]:
         messages.insert(0, SystemMessage(content=system_content))
 
     # Invoke LLM
+    started_at = time.monotonic()
     try:
         response = llm.invoke(messages)
     except Exception as e:
         logger.error(f"LLM invocation failed: {e}")
-        return {
+        failure_update = {
             "error": f"LLM call failed: {e}",
             "step_count": state.get("step_count", 0) + 1,
+            "model_routes": [route],
+            "model_invocation_policies": [route["policy"]],
+            "model_invocation_records": [
+                finish_invocation_record(record, status="failed", started_at=started_at, error=e, profile=profile)
+            ],
+            "model_fallback_decisions": [fallback_decision_for_error(route, record, e)],
         }
+        if not state.get("model_profiles"):
+            failure_update["model_profiles"] = default_model_profiles()
+        return failure_update
 
     logger.info(
         f"LLM response: {len(response.content)} chars, "
@@ -199,7 +211,7 @@ def llm_reason(state: AgentState) -> dict[str, Any]:
     # Check for tool calls → set flags
     has_tool_calls = bool(response.tool_calls)
 
-    return {
+    update = {
         "messages": [response],
         "step_count": state.get("step_count", 0) + 1,
         "step_context": step_context,
@@ -209,6 +221,17 @@ def llm_reason(state: AgentState) -> dict[str, Any]:
         "available_tools": [tool.name for tool in visible_tools],
         "available_tool_specs": visible_specs,
         "context_snapshots": [context_snapshot],
+        "model_routes": [route],
+        "model_invocation_policies": [route["policy"]],
+        "model_invocation_records": [
+            finish_invocation_record(
+                record,
+                status="succeeded",
+                started_at=started_at,
+                output_text=str(response.content) if hasattr(response, "content") else str(response),
+                profile=profile,
+            )
+        ],
         "tool_calls_pending": (
             [
                 {"name": tc["name"], "args": tc["args"], "id": tc["id"]}
@@ -217,3 +240,6 @@ def llm_reason(state: AgentState) -> dict[str, Any]:
             if has_tool_calls else []
         ),
     }
+    if not state.get("model_profiles"):
+        update["model_profiles"] = default_model_profiles()
+    return update

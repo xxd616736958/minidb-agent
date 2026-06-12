@@ -465,6 +465,8 @@ class QualityGate(TypedDict):
         "ci",
         "human_review",
         "delegation_result",
+        "model_routing",
+        "model_output_quality",
     ]
     target_ref: str
     required_checks: list[str]
@@ -487,6 +489,7 @@ class EvaluationCase(TypedDict):
         "postgresql_task",
         "error_recovery",
         "reporting",
+        "model_routing",
     ]
     user_input: str
     initial_state: dict[str, Any]
@@ -537,6 +540,7 @@ class QualityReport(TypedDict):
     test_summary: dict[str, Any]
     evaluation_summary: dict[str, Any]
     safety_summary: dict[str, Any]
+    model_summary: NotRequired[dict[str, Any]]
     uncovered_risks: list[str]
     human_review_required: bool
     recommendations: list[str]
@@ -673,6 +677,130 @@ class AgentTeamRun(TypedDict):
     started_at: str
     completed_at: Optional[str]
     summary: str
+
+
+class ModelProfile(TypedDict):
+    """Runtime model capability and safety profile."""
+
+    id: str
+    provider: Literal["openai", "deepseek", "local", "custom"]
+    model_id: str
+    aliases: list[str]
+    display_name: str
+    description: str
+    context_window_tokens: int
+    max_output_tokens: int
+    supports_tools: bool
+    supports_structured_output: bool
+    supports_streaming: bool
+    supports_reasoning_effort: bool
+    supports_parallel_tool_calls: bool
+    supports_long_context: bool
+    cost_tier: Literal["cheap", "standard", "premium"]
+    quality_tier: Literal["fast", "balanced", "strong", "review"]
+    allowed_tasks: list[str]
+    forbidden_tasks: list[str]
+    allowed_data_sensitivity: Literal["public", "internal", "sensitive", "secret"]
+    deprecated: bool
+
+
+ModelTask = Literal[
+    "intent_understanding",
+    "planning",
+    "tool_reasoning",
+    "sql_safety_review",
+    "delegation_worker",
+    "delegation_reviewer",
+    "error_recovery",
+    "memory_compaction",
+    "report_generation",
+    "quality_evaluation",
+]
+
+
+class ModelInvocationPolicy(TypedDict):
+    """Per-model-task runtime policy used to construct one LLM call."""
+
+    task: ModelTask
+    temperature: float
+    max_tokens: int
+    timeout_seconds: float
+    reasoning_effort: Optional[Literal["low", "medium", "high", "max"]]
+    streaming: bool
+    tools_allowed: bool
+    structured_output_required: bool
+    allow_fallback: bool
+    allow_downshift: bool
+    require_review_model: bool
+
+
+class ModelRoute(TypedDict):
+    """Resolved model choice for a specific task and state."""
+
+    id: str
+    task: ModelTask
+    selected_model_id: str
+    provider: str
+    reason: str
+    required_capabilities: list[str]
+    risk_level: str
+    context_tokens_estimate: int
+    tools_bound: list[str]
+    policy: ModelInvocationPolicy
+    fallback_chain: list[str]
+    created_at: str
+
+
+class ModelInvocationRecord(TypedDict):
+    """Auditable record for one model invocation lifecycle."""
+
+    id: str
+    route_id: str
+    task: ModelTask
+    provider: str
+    model_id: str
+    step_id: Optional[str]
+    delegated_task_id: Optional[str]
+    quality_gate_id: Optional[str]
+    input_tokens_estimate: int
+    output_tokens_estimate: int
+    duration_ms: Optional[int]
+    tools_bound: list[str]
+    structured_output_schema: Optional[str]
+    status: Literal["pending", "succeeded", "failed", "fallback_used"]
+    error_type: Optional[str]
+    fallback_from: Optional[str]
+    cost_estimate: Optional[float]
+    created_at: str
+
+
+class ModelFallbackDecision(TypedDict):
+    """Decision for retrying, upgrading, downshifting, or failing a model call."""
+
+    id: str
+    invocation_id: str
+    from_model_id: str
+    to_model_id: Optional[str]
+    decision: Literal["retry_same_model", "downshift", "upgrade", "ask_user", "fail_closed"]
+    reason: str
+    allowed_by_policy: bool
+    created_at: str
+
+
+class ModelEvaluationResult(TypedDict):
+    """Task-level model quality evaluation result."""
+
+    id: str
+    model_id: str
+    task: ModelTask
+    case_id: str
+    status: Literal["passed", "failed", "needs_review"]
+    scores: dict[str, float]
+    failure_modes: list[str]
+    safety_notes: list[str]
+    cost_estimate: Optional[float]
+    latency_ms: Optional[int]
+    created_at: str
 
 
 class StepContextPacket(TypedDict):
@@ -1237,6 +1365,12 @@ class AgentState(TypedDict):
     delegation_failures: NotRequired[Annotated[list[DelegationFailure], operator.add]]
     delegation_evaluations: NotRequired[Annotated[list[DelegationEvaluation], operator.add]]
     agent_team_runs: NotRequired[Annotated[list[AgentTeamRun], operator.add]]
+    model_profiles: NotRequired[list[ModelProfile]]
+    model_routes: NotRequired[Annotated[list[ModelRoute], operator.add]]
+    model_invocation_policies: NotRequired[Annotated[list[ModelInvocationPolicy], operator.add]]
+    model_invocation_records: NotRequired[Annotated[list[ModelInvocationRecord], operator.add]]
+    model_fallback_decisions: NotRequired[Annotated[list[ModelFallbackDecision], operator.add]]
+    model_evaluation_results: NotRequired[Annotated[list[ModelEvaluationResult], operator.add]]
 
     # Human-readable plan summary injected into system prompt.
     plan: Optional[str]

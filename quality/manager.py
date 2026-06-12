@@ -16,6 +16,10 @@ from agent.state import (
     DelegationResult,
     EvaluationCase,
     EvaluationResult,
+    ModelEvaluationResult,
+    ModelInvocationRecord,
+    ModelProfile,
+    ModelRoute,
     QualityGate,
     QualityReport,
     ReplayCase,
@@ -334,6 +338,92 @@ class QualityManager:
             blocking=bool(failed),
         )
 
+    def model_routing_gate(
+        self,
+        route: ModelRoute,
+        profile: ModelProfile | None = None,
+    ) -> QualityGate:
+        """Validate that a model route satisfies task risk and capability needs."""
+        profile = profile or next(
+            (item for item in self.state.get("model_profiles", []) if item.get("model_id") == route.get("selected_model_id")),
+            None,
+        )
+        required = [
+            "model_profile_known",
+            "required_capabilities_supported",
+            "tool_task_has_tool_model",
+            "high_risk_uses_review_model",
+            "not_deprecated",
+        ]
+        passed: list[str] = []
+        failed: list[str] = []
+        if profile:
+            passed.append("model_profile_known")
+        else:
+            failed.append("model_profile_known")
+        unsupported = [
+            capability for capability in route.get("required_capabilities", [])
+            if not (profile or {}).get(capability, False)
+        ]
+        if unsupported:
+            failed.append("required_capabilities_supported")
+        else:
+            passed.append("required_capabilities_supported")
+        if route.get("task") == "tool_reasoning" and route.get("tools_bound") and not (profile or {}).get("supports_tools", False):
+            failed.append("tool_task_has_tool_model")
+        else:
+            passed.append("tool_task_has_tool_model")
+        high_risk = route.get("risk_level") in {"high", "critical"}
+        review_required = (route.get("policy") or {}).get("require_review_model")
+        if (high_risk or review_required) and (profile or {}).get("quality_tier") != "review":
+            failed.append("high_risk_uses_review_model")
+        else:
+            passed.append("high_risk_uses_review_model")
+        if (profile or {}).get("deprecated"):
+            failed.append("not_deprecated")
+        else:
+            passed.append("not_deprecated")
+        return self.gate(
+            gate_type="model_routing",
+            target_ref=str(route.get("id") or route.get("selected_model_id") or "model-route"),
+            required_checks=required,
+            passed_checks=list(dict.fromkeys(passed)),
+            failed_checks=list(dict.fromkeys(failed)),
+            blocking=bool(failed),
+        )
+
+    def model_output_quality_gate(
+        self,
+        record: ModelInvocationRecord,
+        evaluation: ModelEvaluationResult | None = None,
+    ) -> QualityGate:
+        """Validate a model invocation outcome for runtime quality reporting."""
+        evaluation = evaluation or next(
+            (item for item in self.state.get("model_evaluation_results", []) if item.get("model_id") == record.get("model_id") and item.get("task") == record.get("task")),
+            None,
+        )
+        required = ["invocation_succeeded", "latency_recorded", "cost_recorded", "evaluation_passed"]
+        passed: list[str] = []
+        failed: list[str] = []
+        if record.get("status") in {"succeeded", "fallback_used"}:
+            passed.append("invocation_succeeded")
+        else:
+            failed.append("invocation_succeeded")
+        (passed if record.get("duration_ms") is not None else failed).append("latency_recorded")
+        (passed if record.get("cost_estimate") is not None else failed).append("cost_recorded")
+        if evaluation:
+            (passed if evaluation.get("status") == "passed" else failed).append("evaluation_passed")
+        else:
+            failed.append("evaluation_passed")
+        return self.gate(
+            gate_type="model_output_quality",
+            target_ref=str(record.get("id") or "model-invocation"),
+            required_checks=required,
+            passed_checks=list(dict.fromkeys(passed)),
+            failed_checks=list(dict.fromkeys(failed)),
+            blocking=record.get("task") in {"sql_safety_review", "tool_reasoning"} and bool(failed),
+        )
+
     def run_evaluation_case(self, case: EvaluationCase, state: AgentState | None = None) -> EvaluationResult:
         state = state or self.state
         failed: list[str] = []
@@ -459,6 +549,24 @@ class QualityManager:
             uncovered_risks.append("evaluation_cases_not_run")
         if self.state.get("delegated_tasks") and not self.state.get("delegation_evaluations"):
             uncovered_risks.append("delegation_results_not_evaluated")
+        model_records = self.state.get("model_invocation_records", [])
+        model_routes = self.state.get("model_routes", [])
+        model_gates = [gate for gate in gates if gate.get("gate_type") in {"model_routing", "model_output_quality"}]
+        if model_routes and not model_records:
+            uncovered_risks.append("model_invocations_not_recorded")
+        if model_routes and not model_gates:
+            uncovered_risks.append("model_routing_quality_not_run")
+        high_risk_routes = [
+            route for route in model_routes
+            if route.get("risk_level") in {"high", "critical"} or (route.get("policy") or {}).get("require_review_model")
+        ]
+        profiles = {profile.get("model_id"): profile for profile in self.state.get("model_profiles", [])}
+        high_risk_review_ok = all(
+            profiles.get(route.get("selected_model_id"), {}).get("quality_tier") == "review"
+            for route in high_risk_routes
+        )
+        if high_risk_routes and not high_risk_review_ok:
+            uncovered_risks.append("high_risk_model_route_not_review_tier")
         return {
             "id": _new_id("quality-report"),
             "target_ref": target_ref,
@@ -479,6 +587,15 @@ class QualityManager:
                 "safety_gates": len(safety_gates),
                 "safety_failed": any(gate.get("status") == "failed" for gate in safety_gates),
                 "policy_violation": bool(self.state.get("policy_violation")),
+            },
+            "model_summary": {
+                "model_routes": len(model_routes),
+                "model_invocations": len(model_records),
+                "failed_invocations": len([item for item in model_records if item.get("status") == "failed"]),
+                "fallback_decisions": len(self.state.get("model_fallback_decisions", [])),
+                "high_risk_routes": len(high_risk_routes),
+                "high_risk_review_model_ok": high_risk_review_ok,
+                "estimated_cost": round(sum(float(item.get("cost_estimate") or 0.0) for item in model_records), 6),
             },
             "uncovered_risks": uncovered_risks,
             "human_review_required": human_review_required,
