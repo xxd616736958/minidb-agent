@@ -158,6 +158,53 @@ def print_intent(intent: dict[str, Any]):
     console.print(table)
 
 
+def print_task_card(card: dict[str, Any]):
+    """Display the human-facing task card."""
+    if not card:
+        return
+
+    table = Table(title="Task Card", show_header=False, padding=(0, 2))
+    table.add_column(style="dim")
+    table.add_column(style="cyan")
+    table.add_row("Status", str(card.get("status", "draft")))
+    table.add_row("Goal", str(card.get("goal", ""))[:180])
+    table.add_row("Environment", str(card.get("target_environment", "unknown")))
+    table.add_row("Database", str(card.get("target_database") or "unknown"))
+    table.add_row("Risk", str(card.get("risk_level", "unknown")))
+    table.add_row("Expected Output", str(card.get("expected_output", ""))[:120])
+    missing = card.get("missing_slots") or []
+    if missing:
+        table.add_row("Missing", ", ".join(str(item) for item in missing))
+    constraints = card.get("user_constraints") or []
+    if constraints:
+        table.add_row("Constraints", "; ".join(str(item) for item in constraints[:3]))
+    console.print(table)
+
+
+def print_plan_review(review: dict[str, Any]):
+    """Display the human-facing plan review state."""
+    if not review:
+        return
+
+    status = str(review.get("status", "pending"))
+    style = "yellow" if status == "pending" else "green"
+    body = [
+        f"Plan: {review.get('plan_id')}",
+        f"Status: {status}",
+        f"Reviewed steps: {', '.join(str(item) for item in (review.get('reviewed_steps') or [])[:8])}",
+    ]
+    if review.get("user_message"):
+        body.append(str(review["user_message"]))
+    console.print(
+        Panel(
+            "\n".join(body),
+            title="Plan Review",
+            border_style=style,
+            padding=(1, 1),
+        )
+    )
+
+
 def print_clarification(request: dict[str, Any]):
     """Display a structured clarification request."""
     if not request:
@@ -213,6 +260,7 @@ def print_loop_status(label: str, payload: dict[str, Any]):
         _print_state_runtime(payload)
         _print_safety(payload)
         _print_pending_approval(payload)
+        print_approval_card(payload.get("approval_card") or {})
         decisions = payload.get("tool_policy_decisions") or []
         for decision in decisions:
             console.print(
@@ -242,6 +290,8 @@ def print_loop_status(label: str, payload: dict[str, Any]):
             f"[dim]↳ Memory:[/dim] [cyan]{memory.get('kind')}[/cyan] "
             f"{str(memory.get('summary', ''))[:100]}"
         )
+
+    _print_collaboration_events(payload)
 
 
 def _print_integrity(payload: dict[str, Any]) -> None:
@@ -325,6 +375,43 @@ def _print_pending_approval(payload: dict[str, Any]) -> None:
         "[dim]Pending approval:[/dim] "
         f"[cyan]{approval.get('id')}[/cyan] "
         f"[dim]env={env} risk={approval.get('risk_level')} sql_hash={sql_hash} {impact}[/dim]"
+    )
+
+
+def print_approval_card(card: dict[str, Any]) -> None:
+    """Display a database-specific approval card."""
+    if not card:
+        return
+
+    table = Table(title="Database Approval Card", show_header=False, padding=(0, 2))
+    table.add_column(style="dim")
+    table.add_column(style="cyan")
+    table.add_row("Approval", str(card.get("approval_id", "")))
+    table.add_row("Tool", str(card.get("tool_name", "")))
+    table.add_row("Environment", str(card.get("target_environment", "unknown")))
+    table.add_row("Database", str(card.get("target_database") or "unknown"))
+    table.add_row("Risk", str(card.get("risk_level", "high")))
+    table.add_row("SQL Hash", str(card.get("sql_hash") or "no-sql-hash"))
+    table.add_row("Replay", str(card.get("replay_policy", "")))
+    if card.get("impact_summary"):
+        table.add_row("Impact", str(card.get("impact_summary"))[:140])
+    if card.get("rollback_summary"):
+        table.add_row("Rollback", str(card.get("rollback_summary"))[:140])
+    options = card.get("options") or []
+    if options:
+        table.add_row("Options", ", ".join(str(item) for item in options))
+    console.print(table)
+
+
+def _print_collaboration_events(payload: dict[str, Any]) -> None:
+    events = payload.get("collaboration_events") or []
+    if not events:
+        return
+    latest = events[-1]
+    console.print(
+        "[dim]Collaboration:[/dim] "
+        f"[cyan]{latest.get('event_type')}[/cyan] "
+        f"{str(latest.get('summary', ''))[:120]}"
     )
 
 

@@ -476,6 +476,66 @@ def build_prompt_context(state: AgentState) -> tuple[str, StepContextPacket | No
             )
         )
 
+    task_card = state.get("task_card")
+    plan_review = state.get("plan_review")
+    approval_card = state.get("approval_card")
+    collaboration_events = state.get("collaboration_events", [])[-8:]
+    user_feedback = state.get("user_feedback", [])[-5:]
+    if task_card or plan_review or approval_card or collaboration_events or user_feedback:
+        sections.append(
+            "## Human Collaboration\n"
+            + json.dumps(
+                {
+                    "task_card": {
+                        "id": task_card.get("id"),
+                        "status": task_card.get("status"),
+                        "goal": task_card.get("goal"),
+                        "risk_level": task_card.get("risk_level"),
+                        "target_environment": task_card.get("target_environment"),
+                        "target_database": task_card.get("target_database"),
+                        "missing_slots": task_card.get("missing_slots", []),
+                        "user_constraints": task_card.get("user_constraints", []),
+                    } if task_card else None,
+                    "plan_review": {
+                        "id": plan_review.get("id"),
+                        "plan_id": plan_review.get("plan_id"),
+                        "status": plan_review.get("status"),
+                        "reviewed_steps": plan_review.get("reviewed_steps", [])[:8],
+                        "user_message": plan_review.get("user_message"),
+                    } if plan_review else None,
+                    "approval_card": {
+                        "approval_id": approval_card.get("approval_id"),
+                        "step_id": approval_card.get("step_id"),
+                        "tool_name": approval_card.get("tool_name"),
+                        "risk_level": approval_card.get("risk_level"),
+                        "sql_hash": approval_card.get("sql_hash"),
+                        "replay_policy": approval_card.get("replay_policy"),
+                        "options": approval_card.get("options", []),
+                    } if approval_card else None,
+                    "recent_events": [
+                        {
+                            "event_type": event.get("event_type"),
+                            "step_id": event.get("step_id"),
+                            "summary": event.get("summary"),
+                            "payload_ref": event.get("payload_ref"),
+                        }
+                        for event in collaboration_events
+                    ],
+                    "recent_user_feedback": [
+                        {
+                            "feedback_type": item.get("feedback_type"),
+                            "target_ref": item.get("target_ref"),
+                            "content": item.get("content"),
+                            "structured_delta": item.get("structured_delta", {}),
+                        }
+                        for item in user_feedback
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+
     query = build_memory_query(state)
     memories = state.get("retrieved_memories")
     if memories is None:

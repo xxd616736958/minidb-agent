@@ -43,6 +43,25 @@ class StateValidator:
             errors.append("pending_approval is not bound to the current step.")
             repair_actions.append("Expire pending_approval or move current_step_id to the approved step.")
 
+        intent = state.get("current_intent") or {}
+        task_card = state.get("task_card") or {}
+        if task_card and intent and task_card.get("intent_id") != intent.get("id"):
+            warnings.append("task_card does not reference current_intent.")
+            repair_actions.append("Regenerate task_card from current_intent.")
+
+        plan_review = state.get("plan_review") or {}
+        if plan_review and plan and plan_review.get("plan_id") != plan.get("id"):
+            warnings.append("plan_review does not reference db_task_plan.")
+            repair_actions.append("Regenerate plan_review from db_task_plan.")
+
+        approval_card = state.get("approval_card") or {}
+        if pending and approval_card and approval_card.get("approval_id") != pending.get("id"):
+            errors.append("approval_card does not reference pending_approval.")
+            repair_actions.append("Regenerate approval_card from pending_approval.")
+        if pending and not approval_card:
+            warnings.append("pending_approval has no human-facing approval_card.")
+            repair_actions.append("Render pending_approval as ApprovalCard before waiting for user input.")
+
         db_env = state.get("database_environment") or {}
         runtime_policy = state.get("runtime_policy") or {}
         if db_env.get("is_production") and runtime_policy.get("allow_database_writes"):

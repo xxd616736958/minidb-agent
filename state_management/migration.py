@@ -36,8 +36,19 @@ class StateMigration:
             "tool_execution_results": [],
             "artifact_records": [],
             "replay_policies": [],
+            "collaboration_events": [],
+            "user_feedback": [],
         }
         for key, value in defaults.items():
+            if key not in state:
+                update[key] = value
+
+        nullable_defaults = {
+            "task_card": None,
+            "plan_review": None,
+            "approval_card": None,
+        }
+        for key, value in nullable_defaults.items():
             if key not in state:
                 update[key] = value
 

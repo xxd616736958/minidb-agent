@@ -19,6 +19,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from agent.config import get_settings
 from agent.llm_factory import create_llm_no_tools
 from agent.state import AgentState, DBTaskPlan, TaskStep
+from collaboration.manager import CollaborationManager
 from memory.schema import build_memory_query
 from memory.store import get_memory_store
 
@@ -754,10 +755,12 @@ def task_planner(state: AgentState) -> dict[str, Any]:
     plan_display = _format_plan(tasks, db_task_plan)
     logger.info(f"Task planner created plan: {len(tasks)} steps")
 
-    return {
+    update = {
         "plan": plan_display,
         "task_stack": tasks,
         "db_task_plan": db_task_plan,
         "plan_history": [db_task_plan],
         "current_task_index": 0,
     }
+    update.update(CollaborationManager(state).plan_review_update(db_task_plan))
+    return update

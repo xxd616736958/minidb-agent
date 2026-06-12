@@ -36,7 +36,9 @@ from cli.display import (
     print_intent,
     print_loop_status,
     print_plan,
+    print_plan_review,
     print_session_info,
+    print_task_card,
     print_tool_call,
     print_tool_result,
     print_warning,
@@ -252,6 +254,7 @@ class AgentRepl:
                 plan = output.get("plan") if isinstance(output, dict) else None
                 if db_plan:
                     print_db_plan(db_plan)
+                    print_plan_review(output.get("plan_review") or {})
                 elif plan:
                     print_plan(plan)
 
@@ -263,6 +266,7 @@ class AgentRepl:
                 intent = output.get("current_intent") if isinstance(output, dict) else None
                 if intent:
                     print_intent(intent)
+                    print_task_card(output.get("task_card") or {})
 
             elif node_name == "clarification_gate":
                 request = output.get("pending_clarification") if isinstance(output, dict) else None

@@ -195,6 +195,107 @@ class ApprovalDecision(TypedDict):
     resolved_at: Optional[str]
 
 
+class TaskCard(TypedDict):
+    """Human-facing summary of the agent's current task understanding."""
+
+    id: str
+    intent_id: str
+    title: str
+    goal: str
+    target_environment: str
+    target_database: Optional[str]
+    target_objects: list[dict[str, Any]]
+    risk_level: str
+    expected_output: str
+    missing_slots: list[str]
+    assumptions: list[str]
+    user_constraints: list[str]
+    status: Literal["draft", "confirmed", "needs_clarification", "cancelled"]
+
+
+class PlanReview(TypedDict):
+    """Human-facing review record for a generated database task plan."""
+
+    id: str
+    plan_id: str
+    status: Literal["pending", "approved", "rejected", "edited"]
+    reviewed_steps: list[str]
+    user_message: Optional[str]
+    created_at: str
+    resolved_at: Optional[str]
+
+
+class CollaborationEvent(TypedDict):
+    """Auditable event for key human-agent collaboration moments."""
+
+    id: str
+    event_type: Literal[
+        "task_card_shown",
+        "clarification_requested",
+        "clarification_answered",
+        "plan_shown",
+        "plan_reviewed",
+        "tool_call_shown",
+        "approval_requested",
+        "approval_resolved",
+        "safety_block_explained",
+        "result_explained",
+        "task_paused",
+        "task_resumed",
+        "final_report_shown",
+    ]
+    step_id: Optional[str]
+    summary: str
+    payload_ref: Optional[str]
+    created_at: str
+
+
+class ApprovalCard(TypedDict):
+    """Human-facing database approval card derived from pending_approval."""
+
+    approval_id: str
+    step_id: str
+    tool_name: str
+    target_environment: str
+    target_database: Optional[str]
+    sql_preview: Optional[str]
+    sql_hash: Optional[str]
+    risk_level: str
+    impact_summary: Optional[str]
+    rollback_summary: Optional[str]
+    verification_criteria: list[str]
+    replay_policy: str
+    options: list[Literal[
+        "approve",
+        "reject",
+        "edit",
+        "dry_run_more",
+        "report_only",
+        "clarify",
+    ]]
+
+
+class UserFeedback(TypedDict):
+    """Structured user feedback that can drive state, memory, or policy."""
+
+    id: str
+    feedback_type: Literal[
+        "clarification_answer",
+        "plan_edit",
+        "approval_decision",
+        "constraint",
+        "preference",
+        "correction",
+        "stop",
+        "resume",
+    ]
+    target_ref: Optional[str]
+    content: str
+    structured_delta: dict[str, Any]
+    should_write_memory: bool
+    created_at: str
+
+
 class VerificationResult(TypedDict):
     """Result of checking a step's success criteria."""
 
@@ -700,6 +801,11 @@ class AgentState(TypedDict):
     db_task_plan: NotRequired[Optional[DBTaskPlan]]
     plan_history: NotRequired[Annotated[list[DBTaskPlan], operator.add]]
     replan_trigger: NotRequired[Optional[str]]
+    task_card: NotRequired[Optional[TaskCard]]
+    plan_review: NotRequired[Optional[PlanReview]]
+    approval_card: NotRequired[Optional[ApprovalCard]]
+    collaboration_events: NotRequired[Annotated[list[CollaborationEvent], operator.add]]
+    user_feedback: NotRequired[Annotated[list[UserFeedback], operator.add]]
     current_step_id: NotRequired[Optional[str]]
     loop_status: NotRequired[Literal[
         "running",

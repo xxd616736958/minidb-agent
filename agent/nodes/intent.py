@@ -12,6 +12,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from agent.llm_factory import create_llm_no_tools
 from agent.state import AgentState, ClarificationRequest, DBTaskIntent
+from collaboration.manager import CollaborationManager
 from memory.consolidator import consolidate_explicit_memory_request
 from memory.schema import build_memory_query
 from memory.store import get_memory_store
@@ -333,11 +334,16 @@ def intent_analyzer(state: AgentState) -> dict[str, Any]:
 
     intent = normalize_intent(parsed, user_content)
     explicit_memory_updates = consolidate_explicit_memory_request(state, user_content)
+    feedback_updates = CollaborationManager(state).feedback_update_from_text(
+        user_content,
+        target_ref=intent.get("id"),
+    )
     return {
         "current_intent": intent,
         "intent_history": [intent],
         "selected_workflow": intent.get("suggested_workflow"),
         **explicit_memory_updates,
+        **feedback_updates,
     }
 
 
@@ -506,10 +512,12 @@ def intent_validator(state: AgentState) -> dict[str, Any]:
     elif not intent.get("suggested_workflow"):
         intent["suggested_workflow"] = "unknown_or_mixed_workflow"
 
-    return {
+    update = {
         "current_intent": intent,
         "selected_workflow": intent["suggested_workflow"],
     }
+    update.update(CollaborationManager(state).task_card_update(intent))
+    return update
 
 
 def _question_for_slot(slot: str) -> str:
@@ -558,10 +566,12 @@ def clarification_gate(state: AgentState) -> dict[str, Any]:
         ]
     )
 
-    return {
+    update = {
         "pending_clarification": request,
         "messages": [AIMessage(content="\n".join(lines))],
     }
+    update.update(CollaborationManager(state).clarification_update(request["id"], request["questions"]))
+    return update
 
 
 WORKFLOW_DESCRIPTIONS = {

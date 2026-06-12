@@ -16,6 +16,7 @@ from agent.context import (
     retrieve_relevant_memories,
 )
 from agent.state import AgentState, DBObservation, ResultDigest, TaskStep, VerificationResult
+from collaboration.manager import CollaborationManager
 from execution.environment import ArtifactStore, ExecutionEnvironmentManager
 from memory.consolidator import consolidate_memories
 from safety.engine import SecurityPolicyEngine
@@ -215,6 +216,8 @@ def tool_policy_gate(state: AgentState) -> dict[str, Any]:
         )
         for call, decision in zip(tool_calls, decisions)
     ]
+    collaboration = CollaborationManager(policy_state)
+    tool_events = collaboration.tool_call_events(decisions)
 
     if not blocked:
         return {
@@ -225,6 +228,7 @@ def tool_policy_gate(state: AgentState) -> dict[str, Any]:
             "approval_bindings": approval_bindings,
             "safety_audit_records": safety_audit_records,
             "tool_invocation_records": records,
+            "collaboration_events": tool_events,
             "step_context": packet,
             "output_safety_policy": safety_engine.default_output_policy(),
             **environment_update,
@@ -271,12 +275,24 @@ def tool_policy_gate(state: AgentState) -> dict[str, Any]:
     if pending_approval:
         result["pending_approval"] = pending_approval
         result["approval_decisions"] = [pending_approval]
+        approval_update = CollaborationManager({**policy_state, **result}).approval_card_update(pending_approval)
+        result["approval_card"] = approval_update["approval_card"]
+        result["collaboration_events"] = [*tool_events, *approval_update["collaboration_events"]]
+    else:
+        safety_update = collaboration.safety_block_update(
+            step_id=(current_step or {}).get("id"),
+            violation=result.get("policy_violation"),
+            decisions=blocked,
+        )
+        result["collaboration_events"] = [*tool_events, *safety_update["collaboration_events"]]
     blocked_state = {
         **policy_state,
         **environment_update,
         **{
             "loop_status": result["loop_status"],
             "pending_approval": pending_approval or policy_state.get("pending_approval"),
+            "approval_card": result.get("approval_card") or policy_state.get("approval_card"),
+            "policy_violation": result.get("policy_violation"),
         },
     }
     result.update(StateManager(blocked_state).runtime_update(last_node="tool_policy_gate"))
@@ -375,6 +391,7 @@ def normalize_observation(state: AgentState) -> dict[str, Any]:
     snapshot_state = {**snapshot_state, **manager_update}
     return {
         **manager_update,
+        "collaboration_events": CollaborationManager(snapshot_state).observation_events(observations),
         "context_snapshots": [build_context_snapshot(snapshot_state)],
         **StateValidator(snapshot_state).validation_update(),
     }
@@ -422,6 +439,7 @@ def verify_step(state: AgentState) -> dict[str, Any]:
         "summary": summary,
         "created_at": _now_iso(),
     }
+    is_final_report = step.get("phase") == "report" and status == "passed"
 
     environment_update = ExecutionEnvironmentManager(state).bootstrap_state()
     verification_artifact = ArtifactStore(environment_update.get("task_workspace")).record(
@@ -460,6 +478,12 @@ def verify_step(state: AgentState) -> dict[str, Any]:
             "replan_trigger": "verification_blocked" if status in {"failed", "blocked"} else None,
             "step_context": build_step_context_packet(snapshot_state),
             "context_snapshots": [build_context_snapshot(snapshot_state)],
+            "collaboration_events": [
+                CollaborationManager(snapshot_state).verification_event(
+                    result,
+                    is_final_report=is_final_report,
+                )
+            ],
             **StateManager(state).record_verification(result, verification_artifact, environment_update),
             **memory_updates,
         }
