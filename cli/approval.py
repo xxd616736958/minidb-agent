@@ -137,3 +137,55 @@ def prompt_human_approval(interrupt_payload: dict[str, Any]) -> dict[str, Any]:
 
     else:
         return {"action": "reject"}
+
+
+def prompt_sql_approval(prompt: dict[str, Any]) -> dict[str, Any]:
+    """Render a PostgreSQL-specific approval prompt.
+
+    The caller is responsible for binding the returned decision to the exact
+    `sql_hash` shown here before any write operation is executed.
+    """
+
+    console.clear()
+    console.print()
+    table = Table(title="PostgreSQL Approval Required", border_style="red", show_header=False)
+    table.add_column(style="dim")
+    table.add_column(style="cyan")
+    table.add_row("Approval", str(prompt.get("approval_id") or "unknown"))
+    table.add_row("Environment", str(prompt.get("target_environment") or "unknown"))
+    table.add_row("Database", str(prompt.get("database") or "unknown"))
+    table.add_row("Risk", str(prompt.get("risk_level") or "high"))
+    table.add_row("Classification", str(prompt.get("classification") or "unknown"))
+    table.add_row("SQL Hash", str(prompt.get("sql_hash") or "missing"))
+    if prompt.get("impact_summary"):
+        table.add_row("Impact", str(prompt.get("impact_summary"))[:180])
+    if prompt.get("rollback_summary"):
+        table.add_row("Rollback", str(prompt.get("rollback_summary"))[:180])
+    criteria = prompt.get("verification_criteria") or []
+    if criteria:
+        table.add_row("Verification", "; ".join(str(item) for item in criteria[:3]))
+    table.add_row("SQL Preview", str(prompt.get("sql_preview") or "")[:600])
+    console.print(table)
+    console.print()
+    console.print("[bold]Options:[/bold]")
+    console.print("  [green][a][/green] Approve - execute the SQL matching this hash")
+    console.print("  [red][r][/red] Reject - do not execute")
+    console.print("  [yellow][e][/yellow] Edit SQL - return modified SQL for re-review")
+    console.print("  [cyan][x][/cyan] Explain more - ask agent for more evidence")
+    console.print("  [cyan][d][/cyan] Dry run more - ask agent for safer dry-run checks")
+    console.print("  [blue][o][/blue] Report only - generate report without executing")
+    console.print()
+
+    choice = Prompt.ask("Your choice", choices=["a", "r", "e", "x", "d", "o"], default="r")
+    if choice == "a":
+        return {"action": "approve", "approval_id": prompt.get("approval_id"), "sql_hash": prompt.get("sql_hash")}
+    if choice == "e":
+        new_sql = Prompt.ask("New SQL", default=str(prompt.get("sql_preview") or ""))
+        return {"action": "edit_sql", "approval_id": prompt.get("approval_id"), "sql": new_sql}
+    if choice == "x":
+        return {"action": "explain_more", "approval_id": prompt.get("approval_id")}
+    if choice == "d":
+        return {"action": "dry_run_more", "approval_id": prompt.get("approval_id")}
+    if choice == "o":
+        return {"action": "report_only", "approval_id": prompt.get("approval_id")}
+    return {"action": "reject", "approval_id": prompt.get("approval_id"), "sql_hash": prompt.get("sql_hash")}

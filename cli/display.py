@@ -32,10 +32,10 @@ def print_banner():
     banner = Text()
     banner.append("╔══════════════════════════════════════════════════════╗\n", style="bold blue")
     banner.append("║", style="bold blue")
-    banner.append("  🖥️  zui xiao agent — Terminal Operating Agent   ", style="bold white")
+    banner.append("  🖥️  mini db agent — PostgreSQL Agent          ", style="bold white")
     banner.append("║\n", style="bold blue")
     banner.append("║", style="bold blue")
-    banner.append("  LangGraph • LangChain • LangSmith               ", style="dim cyan")
+    banner.append("  LangGraph • PostgreSQL • Safety Gates        ", style="dim cyan")
     banner.append("║\n", style="bold blue")
     banner.append("╚══════════════════════════════════════════════════════╝", style="bold blue")
     console.print(banner)
@@ -102,6 +102,93 @@ def print_warning(message: str):
         padding=(1, 1),
     )
     console.print(panel)
+
+
+def print_connection_card(card: dict[str, Any]):
+    """Display safe PostgreSQL target metadata."""
+    if not card:
+        return
+    env = str(card.get("target_environment") or "unknown")
+    border = "red" if env in {"prod", "production"} else "yellow" if env == "unknown" else "cyan"
+    table = Table(title="PostgreSQL Target", show_header=False, padding=(0, 2), border_style=border)
+    table.add_column(style="dim")
+    table.add_column(style="cyan")
+    table.add_row("Environment", env)
+    table.add_row("Host", f"{card.get('host', 'unknown')}:{card.get('port', '5432')}")
+    table.add_row("Database", str(card.get("database") or "unknown"))
+    table.add_row("User", str(card.get("user") or "unknown"))
+    table.add_row("Readonly", "yes" if card.get("readonly") else "no")
+    table.add_row("Approval", str(card.get("approval_mode") or "unknown"))
+    table.add_row("Fingerprint", str(card.get("fingerprint") or "unknown"))
+    if card.get("db_profile"):
+        table.add_row("Profile", str(card.get("db_profile")))
+    table.add_row("URL", str(card.get("display_url") or "not-configured"))
+    console.print(table)
+    console.print()
+
+
+def print_cli_event(event: dict[str, Any]):
+    """Render a stable database-task event."""
+    event_type = str(event.get("type") or "event")
+    summary = str(event.get("summary") or "")[:180]
+    style = {
+        "task_understanding": "cyan",
+        "plan_ready": "blue",
+        "safety_check": "yellow",
+        "approval_required": "red",
+        "tool_running": "magenta",
+        "observation_ready": "green",
+        "verification_ready": "green",
+        "delivery_ready": "bold green",
+        "blocked": "red",
+        "error": "red",
+    }.get(event_type, "dim")
+    console.print(f"[{style}]{event_type}[/] {summary}")
+
+
+def print_doctor_report(report: dict[str, Any]):
+    """Display CLI doctor diagnostics."""
+    status = str(report.get("status") or "unknown")
+    style = "green" if status == "passed" else "yellow" if status == "warning" else "red"
+    table = Table(title=f"CLI Doctor: {status}", show_header=True, padding=(0, 1), border_style=style)
+    table.add_column("Check", style="cyan")
+    table.add_column("Status")
+    table.add_column("Summary")
+    for check in report.get("checks", []) or []:
+        check_status = str(check.get("status") or "unknown")
+        check_style = "green" if check_status == "passed" else "yellow" if check_status == "warning" else "red"
+        table.add_row(
+            str(check.get("name") or "unknown"),
+            f"[{check_style}]{check_status}[/]",
+            str(check.get("summary") or "")[:140],
+        )
+    console.print(table)
+
+
+def print_session_index(records: list[dict[str, Any]], *, current_thread_id: str | None = None):
+    """Display local CLI session index records."""
+    if not records:
+        console.print("[dim]No indexed sessions.[/dim]")
+        return
+    table = Table(title="Indexed Sessions", show_header=True, padding=(0, 1))
+    table.add_column("", width=2)
+    table.add_column("Thread", style="cyan")
+    table.add_column("Title")
+    table.add_column("Env")
+    table.add_column("Status")
+    table.add_column("Updated", style="dim")
+    for record in records:
+        tid = str(record.get("thread_id") or "")
+        marker = ">" if current_thread_id and tid == current_thread_id else ""
+        table.add_row(
+            marker,
+            tid[:12],
+            str(record.get("title") or "")[:60],
+            str(record.get("target_environment") or "unknown"),
+            str(record.get("last_status") or "unknown"),
+            str(record.get("updated_at") or "")[:19],
+        )
+    console.print(table)
 
 
 def print_plan(plan_text: str):
@@ -401,12 +488,23 @@ def print_approval_card(card: dict[str, Any]) -> None:
     table.add_row("Environment", str(card.get("target_environment", "unknown")))
     table.add_row("Database", str(card.get("target_database") or "unknown"))
     table.add_row("Risk", str(card.get("risk_level", "high")))
+    if card.get("classification"):
+        table.add_row("Classification", str(card.get("classification")))
     table.add_row("SQL Hash", str(card.get("sql_hash") or "no-sql-hash"))
     table.add_row("Replay", str(card.get("replay_policy", "")))
+    if card.get("sql_preview"):
+        table.add_row("SQL", str(card.get("sql_preview"))[:220])
     if card.get("impact_summary"):
         table.add_row("Impact", str(card.get("impact_summary"))[:140])
+    if card.get("estimated_rows") is not None:
+        table.add_row("Estimated Rows", str(card.get("estimated_rows")))
+    if card.get("transaction_mode"):
+        table.add_row("Transaction", str(card.get("transaction_mode")))
     if card.get("rollback_summary"):
         table.add_row("Rollback", str(card.get("rollback_summary"))[:140])
+    criteria = card.get("verification_criteria") or []
+    if criteria:
+        table.add_row("Verification", "; ".join(str(item) for item in criteria[:3]))
     options = card.get("options") or []
     if options:
         table.add_row("Options", ", ".join(str(item) for item in options))

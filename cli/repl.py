@@ -11,7 +11,6 @@ Features:
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import uuid
 from typing import Any, Optional
@@ -22,28 +21,35 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.markdown import Markdown
-from rich.text import Text
 
 from cli.approval import prompt_human_approval
+from cli.config import CliRuntimeConfig, build_agent_input_context, build_db_connection_card
+from cli.doctor import run_doctor
+from cli.events import CliEventAdapter
 from cli.display import (
     console,
     print_banner,
     print_clarification,
+    print_connection_card,
     print_db_plan,
     print_divider,
+    print_doctor_report,
     print_error,
     print_goodbye,
     print_intent,
     print_loop_status,
     print_plan,
     print_plan_review,
+    print_cli_event,
     print_session_info,
+    print_session_index,
     print_task_card,
     print_tool_call,
     print_tool_result,
     print_warning,
 )
 from cli.history import SessionHistory
+from cli.sessions import SessionIndex, record_from_runtime
 
 # ── Prompt toolkit style ─────────────────────────────────────
 PROMPT_STYLE = Style.from_dict({
@@ -62,15 +68,19 @@ class AgentRepl:
         server_url: str = "http://localhost:2024",
         api_key: Optional[str] = None,
         thread_id: Optional[str] = None,
+        runtime_config: Optional[CliRuntimeConfig] = None,
     ):
-        self.server_url = server_url
-        self.api_key = api_key
+        self.runtime_config = runtime_config or CliRuntimeConfig(server_url=server_url, api_key=api_key)
+        self.server_url = self.runtime_config.server_url
+        self.api_key = self.runtime_config.api_key
         self.thread_id = thread_id
         self._assistant_id: Optional[str] = None
 
         # SDK client (not async context — we use it directly)
-        self.client = get_client(url=server_url, api_key=api_key)
+        self.client = get_client(url=self.server_url, api_key=self.api_key)
         self.history_mgr = SessionHistory(self.client)
+        self.session_index = SessionIndex()
+        self.event_adapter = CliEventAdapter(thread_id or "unknown")
         self.running = False
 
         self.pt_session = PTKPromptSession(
@@ -94,6 +104,8 @@ class AgentRepl:
             self._assistant_id or "agent",
             0,
         )
+        self.event_adapter.thread_id = self.thread_id or "unknown"
+        print_connection_card(build_db_connection_card(self.runtime_config))
 
         while self.running:
             try:
@@ -106,7 +118,7 @@ class AgentRepl:
                     continue
                 await self._send_message(user_input)
             except KeyboardInterrupt:
-                console.print("\n[dim](Ctrl+C again to quit)[/dim]")
+                console.print("\n[dim]Current run interrupted locally. Press Ctrl+C again to quit.[/dim]")
                 try:
                     await self._get_input()
                 except KeyboardInterrupt:
@@ -193,18 +205,62 @@ class AgentRepl:
         elif cmd == "/new":
             self.thread_id = str(uuid.uuid4())
             await self._ensure_thread()
+            self._save_session_index()
             console.print(f"[green]New session: {self.thread_id[:12]}...[/green]")
             return True
         elif cmd == "/resume":
             if args:
                 self.thread_id = args[0]
                 await self._ensure_thread()
+                self._save_session_index()
                 console.print(f"[green]Resumed: {self.thread_id[:12]}...[/green]")
             else:
                 console.print("[red]Usage: /resume <thread_id>[/red]")
             return True
         elif cmd == "/plan":
             await self._cmd_show_plan()
+            return True
+        elif cmd == "/risk":
+            await self._cmd_risk()
+            return True
+        elif cmd == "/approvals":
+            await self._cmd_approvals()
+            return True
+        elif cmd == "/artifacts":
+            await self._cmd_artifacts()
+            return True
+        elif cmd == "/db":
+            print_connection_card(build_db_connection_card(self.runtime_config))
+            return True
+        elif cmd == "/schema":
+            await self._send_message(_schema_prompt(args))
+            return True
+        elif cmd == "/tables":
+            await self._send_message("列出当前 PostgreSQL 数据库中的用户表，按 schema 分组，只执行只读元数据查询。")
+            return True
+        elif cmd == "/readonly":
+            if args and args[0].lower() in {"on", "true", "1"}:
+                self.runtime_config = _replace_config(self.runtime_config, readonly=True)
+                console.print("[green]Readonly mode enabled for new runs.[/green]")
+            elif args and args[0].lower() in {"off", "false", "0"}:
+                self.runtime_config = _replace_config(self.runtime_config, readonly=False)
+                console.print("[yellow]Readonly mode disabled for new runs; backend safety still applies.[/yellow]")
+            else:
+                console.print(f"[dim]Readonly:[/dim] {self.runtime_config.readonly}")
+            return True
+        elif cmd == "/doctor":
+            report = await run_doctor(self.runtime_config)
+            print_doctor_report(report)
+            return True
+        elif cmd == "/cancel":
+            await self._cmd_cancel()
+            return True
+        elif cmd == "/archive":
+            target = args[0] if args else self.thread_id
+            if target and self.session_index.archive(target):
+                console.print(f"[green]Archived: {target[:12]}...[/green]")
+            else:
+                console.print("[yellow]No indexed session matched.[/yellow]")
             return True
         elif cmd == "/clear":
             console.clear()
@@ -221,16 +277,21 @@ class AgentRepl:
         print_divider()
 
         try:
+            stream_input = {
+                "messages": [{"role": "user", "content": content}],
+                **build_agent_input_context(self.runtime_config),
+            }
             async for event in self.client.runs.stream(
                 thread_id=self.thread_id,
                 assistant_id=self._assistant_id,
-                input={"messages": [{"role": "user", "content": content}]},
+                input=stream_input,
                 stream_mode="updates",
             ):
                 self._process_event(event)
         except Exception as e:
             print_error(f"Agent error: {e}")
 
+        await self._save_session_index_async()
         print_divider()
         console.print()
 
@@ -244,6 +305,9 @@ class AgentRepl:
 
         if not isinstance(data, dict):
             return
+
+        for cli_event in self.event_adapter.events_from_stream_data(data):
+            print_cli_event(cli_event)
 
         for node_name, output in data.items():
             if node_name in ("__start__", "__interrupt__"):
@@ -286,6 +350,11 @@ class AgentRepl:
                     print_loop_status(node_name, output)
                 self._process_messages(output.get("messages", []), is_tool=True)
 
+            elif node_name == "final_report":
+                if isinstance(output, dict):
+                    print_loop_status(node_name, output)
+                    self._process_messages(output.get("messages", []))
+
             elif node_name == "memory_compactor" and output is not None:
                 console.print("[dim]📦 Memory compacted[/dim]")
 
@@ -323,6 +392,15 @@ class AgentRepl:
   [cyan]/history[/cyan]    Show checkpoint history
   [cyan]/info[/cyan]       Agent info
   [cyan]/plan[/cyan]       Current plan
+  [cyan]/risk[/cyan]       Current risk and safety state
+  [cyan]/approvals[/cyan]  Pending and recent SQL approvals
+  [cyan]/artifacts[/cyan]  Delivery reports and artifact paths
+  [cyan]/db[/cyan]         Current PostgreSQL target card
+  [cyan]/schema[/cyan]     Inspect schema/table metadata
+  [cyan]/tables[/cyan]     List user tables
+  [cyan]/doctor[/cyan]     Diagnose server, database, workspace
+  [cyan]/readonly[/cyan]   Show or set readonly mode
+  [cyan]/archive[/cyan]    Archive indexed session
   [cyan]/clear[/cyan]      Clear screen
 """))
 
@@ -333,6 +411,7 @@ class AgentRepl:
                 tid = t.get("thread_id", "?")
                 marker = "→ " if tid == self.thread_id else "  "
                 console.print(f"{marker}[cyan]{tid[:12]}...[/cyan]")
+            print_session_index(self.session_index.list(limit=20), current_thread_id=self.thread_id)
         except Exception as e:
             console.print(f"[red]{e}[/red]")
 
@@ -343,7 +422,8 @@ class AgentRepl:
         try:
             import httpx
             async with httpx.AsyncClient() as hc:
-                resp = await hc.get(f"{self.server_url}/agent/info")
+                headers = {"X-API-Key": self.api_key} if self.api_key else {}
+                resp = await hc.get(f"{self.server_url}/agent/info", headers=headers)
                 console.print_json(data=resp.json())
         except Exception as e:
             console.print(f"[dim]{e}[/dim]")
@@ -367,3 +447,107 @@ class AgentRepl:
                     console.print("[dim]No active plan.[/dim]")
         except Exception as e:
             console.print(f"[dim]{e}[/dim]")
+
+    async def _cmd_risk(self):
+        vals = await self._current_values()
+        intent = vals.get("current_intent") or {}
+        runtime = vals.get("db_task_runtime") or {}
+        safety = vals.get("security_policy_decisions") or []
+        sql_reports = vals.get("sql_safety_reports") or []
+        console.print_json(
+            data={
+                "intent_risk": intent.get("risk_level"),
+                "runtime_risk": runtime.get("risk_level"),
+                "latest_security_decision": safety[-1] if safety else None,
+                "latest_sql_safety_report": sql_reports[-1] if sql_reports else None,
+            }
+        )
+
+    async def _cmd_approvals(self):
+        vals = await self._current_values()
+        pending = vals.get("pending_approval")
+        card = vals.get("approval_card")
+        decisions = vals.get("approval_decisions") or []
+        console.print_json(data={"pending_approval": pending, "approval_card": card, "approval_decisions": decisions[-10:]})
+
+    async def _cmd_artifacts(self):
+        vals = await self._current_values()
+        console.print_json(
+            data={
+                "delivery_packages": vals.get("delivery_packages") or [],
+                "artifact_manifests": vals.get("artifact_manifests") or [],
+                "artifact_records": vals.get("artifact_records") or [],
+            }
+        )
+
+    async def _cmd_cancel(self):
+        if not self.thread_id:
+            console.print("[yellow]No active session.[/yellow]")
+            return
+        try:
+            runs = await self.client.runs.list(self.thread_id, limit=10)
+            candidates = [
+                run for run in runs
+                if str(run.get("status") or "").lower() in {"pending", "running"}
+            ]
+            if not candidates:
+                console.print("[dim]No pending or running run to cancel.[/dim]")
+                return
+            run_id = candidates[0].get("run_id") or candidates[0].get("id")
+            await self.client.runs.cancel(self.thread_id, run_id, wait=False, action="interrupt")
+            console.print(f"[yellow]Cancelled run: {str(run_id)[:12]}...[/yellow]")
+        except Exception as e:
+            console.print(f"[red]Cancel failed: {e}[/red]")
+
+    async def _current_values(self) -> dict[str, Any]:
+        try:
+            state = await self.client.threads.get_state(self.thread_id)
+            return state.get("values", {}) if state else {}
+        except Exception as e:
+            console.print(f"[dim]{e}[/dim]")
+            return {}
+
+    def _save_session_index(self):
+        if not self.runtime_config.save_session or not self.thread_id:
+            return
+        try:
+            vals: dict[str, Any] = {}
+            # Avoid blocking on async state fetch here; the next command/run will refresh
+            # via explicit state reads. This record still indexes the thread safely.
+            self.session_index.upsert(
+                record_from_runtime(
+                    self.runtime_config,
+                    thread_id=self.thread_id,
+                    state_values=vals,
+                )
+            )
+        except Exception:
+            pass
+
+    async def _save_session_index_async(self):
+        if not self.runtime_config.save_session or not self.thread_id:
+            return
+        vals = await self._current_values()
+        try:
+            self.session_index.upsert(
+                record_from_runtime(
+                    self.runtime_config,
+                    thread_id=self.thread_id,
+                    state_values=vals,
+                )
+            )
+        except Exception:
+            pass
+
+
+def _schema_prompt(args: list[str]) -> str:
+    if args:
+        target = " ".join(args)
+        return f"查看 PostgreSQL 对象 {target} 的结构摘要，只执行只读元数据查询。"
+    return "查看当前 PostgreSQL 数据库的 schema 摘要，只执行只读元数据查询。"
+
+
+def _replace_config(config: CliRuntimeConfig, **updates: Any) -> CliRuntimeConfig:
+    data = dict(config.__dict__)
+    data.update(updates)
+    return CliRuntimeConfig(**data)
