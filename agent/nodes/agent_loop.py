@@ -17,6 +17,8 @@ from agent.context import (
 )
 from agent.state import AgentState, DBObservation, ResultDigest, TaskStep, VerificationResult
 from collaboration.manager import CollaborationManager
+from error_handling.classifier import ErrorClassifier
+from error_handling.recovery import RecoveryEngine
 from execution.environment import ArtifactStore, ExecutionEnvironmentManager
 from memory.consolidator import consolidate_memories
 from safety.engine import SecurityPolicyEngine
@@ -415,12 +417,22 @@ def verify_step(state: AgentState) -> dict[str, Any]:
         obs for obs in state.get("db_observations", [])
         if obs.get("step_id") == step.get("id")
     ]
+    failed_results = [
+        result
+        for result in state.get("tool_execution_results", [])
+        if result.get("success") is False
+    ]
     policy_violation = state.get("policy_violation")
     criteria = step.get("success_criteria", [])
 
     if policy_violation and policy_violation.get("step_id") == step.get("id"):
         status = "blocked"
         summary = policy_violation.get("message", "Step blocked by tool policy.")
+        step["status"] = "failed"
+        step["error"] = summary
+    elif failed_results:
+        status = "blocked"
+        summary = str(failed_results[-1].get("summary") or "Tool execution failed.")
         step["status"] = "failed"
         step["error"] = summary
     else:
@@ -472,6 +484,14 @@ def verify_step(state: AgentState) -> dict[str, Any]:
         "artifact_records": [*state.get("artifact_records", []), verification_artifact],
     }
     memory_updates = consolidate_memories(snapshot_state) if status == "passed" else {}
+    error_recovery_updates: dict[str, Any] = {}
+    if status in {"failed", "blocked"}:
+        classifier = ErrorClassifier(snapshot_state)
+        error_record = classifier.from_policy_violation()
+        if not error_record and failed_results:
+            error_record = classifier.from_tool_result(failed_results[-1])
+        if error_record:
+            error_recovery_updates = RecoveryEngine(snapshot_state).update_for_error(error_record)
     update.update(
         {
             "loop_status": "blocked" if status in {"failed", "blocked"} else "running",
@@ -486,6 +506,7 @@ def verify_step(state: AgentState) -> dict[str, Any]:
             ],
             **StateManager(state).record_verification(result, verification_artifact, environment_update),
             **memory_updates,
+            **error_recovery_updates,
         }
     )
     final_state = {**state, **update}

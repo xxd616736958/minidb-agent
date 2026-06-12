@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from langchain_core.messages import ToolMessage
 
 from agent.state import AgentState
+from collaboration.manager import CollaborationManager
+from error_handling.classifier import ErrorClassifier
 from execution.environment import ArtifactStore, ExecutionEnvironmentManager
 from safety.engine import SecurityPolicyEngine
 from state_management.manager import StateManager
@@ -291,6 +293,21 @@ def execute_tools(state: AgentState) -> dict[str, Any]:
         for result in structured_results
         if result.get("tool_call_id")
     ]
+    classifier = ErrorClassifier({**state, **environment_update})
+    error_records = [
+        record
+        for record in (classifier.from_tool_result(result) for result in structured_results)
+        if record
+    ]
+    collaboration_events = [
+        CollaborationManager({}).event(
+            "error_explained",
+            f"{record.get('error_type')}: {record.get('message')}",
+            step_id=record.get("step_id"),
+            payload_ref=record.get("id"),
+        )
+        for record in error_records
+    ]
     final_update = {
         "messages": new_messages,
         "tool_call_results": tool_results,
@@ -301,6 +318,8 @@ def execute_tools(state: AgentState) -> dict[str, Any]:
         "tool_invocation_records": _update_invocation_records(state, structured_results, artifact_records),
         "artifact_records": artifact_records,
         "replay_policies": replay_policies,
+        "error_records": error_records,
+        "collaboration_events": collaboration_events,
         **environment_update,
         "task_stack": task_stack,
         "db_task_plan": db_task_plan,

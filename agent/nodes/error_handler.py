@@ -1,11 +1,4 @@
-"""Error handler node — retry, backtrack, and circuit-breaker logic.
-
-Handles errors from any node in the graph:
-  - Retryable errors: retry up to max_retries with exponential backoff info
-  - Non-retryable errors: pass the error message to the user
-  - Timeout errors: retry with increased timeout context
-  - Persistent failures: escalate with clear error message
-"""
+"""Structured error handler node for PostgreSQL task self-repair."""
 
 from __future__ import annotations
 
@@ -14,120 +7,156 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, SystemMessage
 
-from agent.config import get_settings
-from agent.state import AgentState
+from agent.state import AgentState, ErrorRecord, RecoveryDecision
+from collaboration.manager import CollaborationManager
+from error_handling.classifier import ErrorClassifier
+from error_handling.recovery import RecoveryEngine
+from state_management.manager import StateManager
+from state_management.validator import StateValidator
 
 logger = logging.getLogger(__name__)
 
-# ── Error classification ─────────────────────────────────────
 
-RETRYABLE_PATTERNS = [
-    "timeout",
-    "timed out",
-    "connection",
-    "rate limit",
-    "429",
-    "503",
-    "502",
-    "temporarily",
-]
-
-NON_RETRYABLE_PATTERNS = [
-    "permission denied",
-    "not found",
-    "invalid",
-    "authentication",
-    "400",
-    "401",
-    "403",
-    "api key",
-    "quota",
-    "tool_calls must be followed",
-    "insufficient tool messages",
-    "bad request",
-]
+def _latest_integrity_error(state: AgentState) -> ErrorRecord | None:
+    report = (state.get("state_integrity_reports") or [None])[-1]
+    return ErrorClassifier(state).from_integrity_report(report)
 
 
-def _is_retryable(error_msg: str) -> bool:
-    """Classify an error as retryable or not based on its message."""
-    lower = error_msg.lower()
-    for pattern in RETRYABLE_PATTERNS:
-        if pattern in lower:
-            return True
-    for pattern in NON_RETRYABLE_PATTERNS:
-        if pattern in lower:
-            return False
-    # Default: retry transient-looking errors
-    return True
+def _active_error(state: AgentState) -> ErrorRecord | None:
+    classifier = ErrorClassifier(state)
+    return (
+        classifier.from_state_error(node_name=(state.get("state_metadata") or {}).get("last_node"))
+        or classifier.from_policy_violation()
+        or _latest_integrity_error(state)
+        or ((state.get("error_records") or [None])[-1])
+    )
 
 
-# ── Node implementation ──────────────────────────────────────
+def _system_recovery_message(error: ErrorRecord, decision: RecoveryDecision) -> SystemMessage:
+    content = (
+        "Structured recovery decision for the current PostgreSQL task:\n"
+        f"- error_id: {error.get('id')}\n"
+        f"- error_type: {error.get('error_type')}\n"
+        f"- source: {error.get('source')}\n"
+        f"- step_id: {error.get('step_id')}\n"
+        f"- tool_name: {error.get('tool_name')}\n"
+        f"- sql_hash: {error.get('sql_hash')}\n"
+        f"- recovery_action: {decision.get('action')}\n"
+        f"- reason: {decision.get('reason')}\n"
+        f"- requires_new_approval: {decision.get('requires_new_approval')}\n\n"
+        "Follow this recovery action without changing the user's task goal. "
+        "If SQL is rewritten, run safety checks again; changed write SQL requires a new approval."
+    )
+    return SystemMessage(content=content)
+
+
+def _user_error_message(error: ErrorRecord, decision: RecoveryDecision, report_summary: str | None = None) -> AIMessage:
+    options = [
+        "改为只读诊断",
+        "只生成报告",
+        "补充权限、连接或审批信息后继续",
+        "调整任务范围并重新规划",
+    ]
+    content = (
+        "数据库任务暂时无法自动继续。\n\n"
+        f"- 错误类型：{error.get('error_type')}\n"
+        f"- 发生步骤：{error.get('step_id') or 'unknown'}\n"
+        f"- 原因：{error.get('message')}\n"
+        f"- 处理建议：{decision.get('reason')}\n"
+        f"- 是否需要新审批：{decision.get('requires_new_approval')}\n\n"
+        "可选下一步：\n"
+        + "\n".join(f"{idx}. {item}" for idx, item in enumerate(options, start=1))
+    )
+    if report_summary:
+        content += f"\n\n错误报告摘要：{report_summary}"
+    return AIMessage(content=content)
+
+
+def _collaboration_events(error: ErrorRecord, decision: RecoveryDecision) -> list[dict[str, Any]]:
+    manager = CollaborationManager({})
+    events = [
+        manager.event(
+            "error_explained",
+            f"{error.get('error_type')}: {error.get('message')}",
+            step_id=error.get("step_id"),
+            payload_ref=error.get("id"),
+        ),
+        manager.event(
+            "repair_attempted",
+            f"Recovery action selected: {decision.get('action')} - {decision.get('reason')}",
+            step_id=error.get("step_id"),
+            payload_ref=decision.get("id"),
+        ),
+    ]
+    if decision.get("action") == "auto_retry":
+        events.append(
+            manager.event(
+                "retry_scheduled",
+                f"Retry scheduled for {error.get('error_type')}.",
+                step_id=error.get("step_id"),
+                payload_ref=decision.get("id"),
+            )
+        )
+    if decision.get("action") in {"ask_user", "abort_safely"}:
+        events.append(
+            manager.event(
+                "user_action_required",
+                f"User action required for {error.get('error_type')}.",
+                step_id=error.get("step_id"),
+                payload_ref=decision.get("id"),
+            )
+        )
+    return events
+
 
 def error_handler(state: AgentState) -> dict[str, Any]:
-    """Error handler node — decides retry, escalate, or abort.
-
-    Called when the `error` field is set on the state.
-    Evaluates the error, retry count, and decides the next action.
-
-    Returns:
-        Updated state with error cleared (for retry) or a final
-        error message for the user.
-    """
-    settings = get_settings()
-    error_msg = state.get("error", "Unknown error")
-    retry_count = state.get("retry_count", 0)
-    max_retries = state.get("max_retries", settings.max_retries)
+    """Classify the active error, select a recovery action, and update state."""
     messages = list(state.get("messages", []))
+    error = _active_error(state)
+    if not error:
+        return {"error": None}
 
+    engine = RecoveryEngine(state)
+    recovery_update = engine.update_for_error(error)
+    decision = recovery_update["active_recovery_decision"]
     logger.warning(
-        f"Error handler: attempt {retry_count + 1}/{max_retries} — {error_msg[:100]}"
+        "Recovery decision: %s for %s (%s)",
+        decision.get("action"),
+        error.get("id"),
+        error.get("error_type"),
     )
 
-    # Check if retries exhausted
-    if retry_count >= max_retries:
-        logger.error(f"Max retries ({max_retries}) exhausted: {error_msg}")
-        return {
-            "error": None,  # Clear error so graph can terminate
-            "messages": messages + [
-                AIMessage(
-                    content=(
-                        f"❌ **Failed after {max_retries} retries.**\n\n"
-                        f"Error: {error_msg}\n\n"
-                        f"Please check your configuration, try a different approach, "
-                        f"or simplify your request."
-                    )
-                ),
-            ],
-        }
-
-    # Classify error
-    if not _is_retryable(error_msg):
-        # Non-retryable — report immediately
-        logger.error(f"Non-retryable error: {error_msg}")
-        return {
-            "error": None,
-            "messages": messages + [
-                AIMessage(
-                    content=(
-                        f"❌ **Error (non-retryable):** {error_msg}\n\n"
-                        f"This error cannot be resolved by retrying. "
-                        f"Please check your setup and try again."
-                    )
-                ),
-            ],
-        }
-
-    # Retryable — increment counter and add context for LLM
-    retry_msg = (
-        f"⚠️ Attempt {retry_count + 1} failed: {error_msg}\n"
-        f"Retrying (attempt {retry_count + 2} of {max_retries})...\n"
-        f"Please try a different approach if possible."
-    )
-
-    logger.info(f"Retrying after error (attempt {retry_count + 2}/{max_retries})")
-
-    return {
-        "error": None,  # Clear error for retry
-        "retry_count": retry_count + 1,
-        "messages": messages + [SystemMessage(content=retry_msg)],
+    update: dict[str, Any] = {
+        **recovery_update,
+        "error": None,
+        "collaboration_events": _collaboration_events(error, decision),
     }
+
+    action = decision.get("action")
+    if action in {"auto_retry", "rewrite_sql", "adjust_tool_args", "run_diagnostic_tool"}:
+        update["retry_count"] = int(state.get("retry_count") or 0) + 1
+        update["messages"] = messages + [_system_recovery_message(error, decision)]
+        update["loop_status"] = "running"
+    elif action == "repair_state":
+        update["retry_count"] = int(state.get("retry_count") or 0) + 1
+        update["messages"] = messages + [_system_recovery_message(error, decision)]
+        update["loop_status"] = "replanning"
+    elif action == "replan_step":
+        update["retry_count"] = 0
+        update["messages"] = messages + [_system_recovery_message(error, decision)]
+        update["replan_trigger"] = f"error:{error.get('error_type')}"
+        update["loop_status"] = "replanning"
+    else:
+        report = engine.error_report(
+            status="failed",
+            summary=f"{error.get('error_type')}: {error.get('message')}",
+        )
+        update["error_reports"] = [report]
+        update["retry_count"] = 0
+        update["messages"] = messages + [_user_error_message(error, decision, report.get("user_summary"))]
+        update["loop_status"] = "blocked"
+
+    next_state = {**state, **update}
+    update.update(StateManager(next_state).runtime_update(last_node="error_handler"))
+    update.update(StateValidator(next_state).validation_update())
+    return update

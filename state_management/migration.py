@@ -38,6 +38,12 @@ class StateMigration:
             "replay_policies": [],
             "collaboration_events": [],
             "user_feedback": [],
+            "error_records": [],
+            "recovery_decisions": [],
+            "recovery_attempts": [],
+            "retry_budgets": [],
+            "state_repair_actions": [],
+            "error_reports": [],
         }
         for key, value in defaults.items():
             if key not in state:
@@ -47,6 +53,7 @@ class StateMigration:
             "task_card": None,
             "plan_review": None,
             "approval_card": None,
+            "active_recovery_decision": None,
         }
         for key, value in nullable_defaults.items():
             if key not in state:

@@ -243,6 +243,12 @@ class CollaborationEvent(TypedDict):
         "task_paused",
         "task_resumed",
         "final_report_shown",
+        "error_explained",
+        "repair_attempted",
+        "retry_scheduled",
+        "repair_succeeded",
+        "repair_failed",
+        "user_action_required",
     ]
     step_id: Optional[str]
     summary: str
@@ -305,6 +311,143 @@ class VerificationResult(TypedDict):
     criteria_checked: list[str]
     evidence_ids: list[str]
     summary: str
+    created_at: str
+
+
+class ErrorRecord(TypedDict):
+    """Structured error record for PostgreSQL task recovery."""
+
+    id: str
+    source: Literal[
+        "llm",
+        "tool",
+        "postgresql",
+        "safety_policy",
+        "state",
+        "approval",
+        "user",
+        "system",
+    ]
+    error_type: Literal[
+        "connection_error",
+        "auth_error",
+        "permission_denied",
+        "syntax_error",
+        "sql_semantic_error",
+        "object_not_found",
+        "lock_timeout",
+        "statement_timeout",
+        "deadlock_detected",
+        "constraint_violation",
+        "policy_denied",
+        "approval_missing",
+        "approval_mismatch",
+        "state_integrity_error",
+        "tool_schema_error",
+        "tool_runtime_error",
+        "llm_output_error",
+        "unknown",
+    ]
+    severity: Literal["info", "warning", "error", "critical"]
+    node_name: Optional[str]
+    step_id: Optional[str]
+    tool_name: Optional[str]
+    tool_call_id: Optional[str]
+    sql_hash: Optional[str]
+    sqlstate: Optional[str]
+    target_environment: str
+    target_database: Optional[str]
+    message: str
+    raw_excerpt: Optional[str]
+    retryable: bool
+    requires_user_action: bool
+    created_at: str
+
+
+class RecoveryDecision(TypedDict):
+    """Decision selected by the self-repair controller."""
+
+    id: str
+    error_id: str
+    action: Literal[
+        "auto_retry",
+        "rewrite_sql",
+        "adjust_tool_args",
+        "run_diagnostic_tool",
+        "repair_state",
+        "replan_step",
+        "ask_user",
+        "abort_safely",
+    ]
+    reason: str
+    confidence: float
+    safety_notes: list[str]
+    requires_new_approval: bool
+    next_node: Optional[str]
+    created_at: str
+
+
+class RecoveryAttempt(TypedDict):
+    """One recovery attempt bound to an error and decision."""
+
+    id: str
+    error_id: str
+    decision_id: str
+    step_id: Optional[str]
+    attempt_no: int
+    action: str
+    status: Literal["pending", "running", "succeeded", "failed", "skipped"]
+    summary: str
+    created_at: str
+    completed_at: Optional[str]
+
+
+class RetryBudget(TypedDict):
+    """Retry budget scoped to step/tool/error/sql hash."""
+
+    scope_key: str
+    step_id: Optional[str]
+    tool_name: Optional[str]
+    error_type: str
+    sql_hash: Optional[str]
+    attempts: int
+    max_attempts: int
+    exhausted: bool
+    last_error_id: Optional[str]
+
+
+class StateRepairAction(TypedDict):
+    """State repair action derived from StateIntegrityReport."""
+
+    id: str
+    source_report_id: str
+    action_type: Literal[
+        "sync_plan_stack",
+        "reset_current_step",
+        "expire_pending_approval",
+        "regenerate_approval_card",
+        "normalize_tool_result",
+        "refresh_step_context",
+        "mark_step_blocked",
+    ]
+    description: str
+    status: Literal["pending", "applied", "failed", "skipped"]
+    created_at: str
+
+
+class ErrorReport(TypedDict):
+    """Final human-facing report when recovery fails or partially succeeds."""
+
+    id: str
+    task_id: Optional[str]
+    plan_id: Optional[str]
+    step_id: Optional[str]
+    status: Literal["recovered", "partially_recovered", "failed"]
+    error_ids: list[str]
+    recovery_attempt_ids: list[str]
+    evidence_refs: list[str]
+    user_summary: str
+    next_options: list[str]
     created_at: str
 
 
@@ -850,6 +993,13 @@ class AgentState(TypedDict):
     state_integrity_reports: NotRequired[Annotated[list[StateIntegrityReport], operator.add]]
     replay_policies: NotRequired[Annotated[list[ReplayPolicy], operator.add]]
     recovery_summary: NotRequired[Optional[str]]
+    error_records: NotRequired[Annotated[list[ErrorRecord], operator.add]]
+    recovery_decisions: NotRequired[Annotated[list[RecoveryDecision], operator.add]]
+    recovery_attempts: NotRequired[Annotated[list[RecoveryAttempt], operator.add]]
+    retry_budgets: NotRequired[list[RetryBudget]]
+    state_repair_actions: NotRequired[Annotated[list[StateRepairAction], operator.add]]
+    error_reports: NotRequired[Annotated[list[ErrorReport], operator.add]]
+    active_recovery_decision: NotRequired[Optional[RecoveryDecision]]
 
     # Human-readable plan summary injected into system prompt.
     plan: Optional[str]

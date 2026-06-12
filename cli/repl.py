@@ -258,9 +258,11 @@ class AgentRepl:
                 elif plan:
                     print_plan(plan)
 
-            elif node_name in ("state_recovery", "step_scheduler", "normalize_observation", "verify_step", "tool_policy_gate"):
+            elif node_name in ("state_recovery", "step_scheduler", "normalize_observation", "verify_step", "tool_policy_gate", "error_handler"):
                 if isinstance(output, dict):
                     print_loop_status(node_name, output)
+                    if node_name == "error_handler":
+                        self._process_messages(output.get("messages", []))
 
             elif node_name == "intent_validator":
                 intent = output.get("current_intent") if isinstance(output, dict) else None

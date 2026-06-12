@@ -536,6 +536,80 @@ def build_prompt_context(state: AgentState) -> tuple[str, StepContextPacket | No
             )
         )
 
+    error_records = state.get("error_records", [])[-5:]
+    recovery_decisions = state.get("recovery_decisions", [])[-5:]
+    recovery_attempts = state.get("recovery_attempts", [])[-5:]
+    retry_budgets = state.get("retry_budgets", [])[-5:]
+    active_decision = state.get("active_recovery_decision")
+    error_reports = state.get("error_reports", [])[-3:]
+    if error_records or recovery_decisions or recovery_attempts or retry_budgets or active_decision or error_reports:
+        sections.append(
+            "## Error Handling and Self-Repair\n"
+            + json.dumps(
+                {
+                    "active_recovery_decision": {
+                        "id": active_decision.get("id"),
+                        "error_id": active_decision.get("error_id"),
+                        "action": active_decision.get("action"),
+                        "reason": active_decision.get("reason"),
+                        "requires_new_approval": active_decision.get("requires_new_approval"),
+                        "next_node": active_decision.get("next_node"),
+                    } if active_decision else None,
+                    "recent_errors": [
+                        {
+                            "id": item.get("id"),
+                            "source": item.get("source"),
+                            "error_type": item.get("error_type"),
+                            "severity": item.get("severity"),
+                            "step_id": item.get("step_id"),
+                            "tool_name": item.get("tool_name"),
+                            "sql_hash": item.get("sql_hash"),
+                            "sqlstate": item.get("sqlstate"),
+                            "retryable": item.get("retryable"),
+                            "requires_user_action": item.get("requires_user_action"),
+                            "message": item.get("message"),
+                        }
+                        for item in error_records
+                    ],
+                    "recent_recovery_decisions": [
+                        {
+                            "id": item.get("id"),
+                            "error_id": item.get("error_id"),
+                            "action": item.get("action"),
+                            "reason": item.get("reason"),
+                            "requires_new_approval": item.get("requires_new_approval"),
+                            "next_node": item.get("next_node"),
+                        }
+                        for item in recovery_decisions
+                    ],
+                    "recent_recovery_attempts": [
+                        {
+                            "id": item.get("id"),
+                            "error_id": item.get("error_id"),
+                            "action": item.get("action"),
+                            "status": item.get("status"),
+                            "attempt_no": item.get("attempt_no"),
+                            "summary": item.get("summary"),
+                        }
+                        for item in recovery_attempts
+                    ],
+                    "retry_budgets": retry_budgets,
+                    "recent_error_reports": [
+                        {
+                            "id": item.get("id"),
+                            "status": item.get("status"),
+                            "step_id": item.get("step_id"),
+                            "user_summary": item.get("user_summary"),
+                            "next_options": item.get("next_options", []),
+                        }
+                        for item in error_reports
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+
     query = build_memory_query(state)
     memories = state.get("retrieved_memories")
     if memories is None:

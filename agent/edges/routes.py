@@ -227,12 +227,21 @@ def route_after_verify(
 
 def route_after_error_handler(
     state: AgentState,
-) -> Literal["llm_reason", END]:
+) -> Literal["llm_reason", "task_planner", "state_recovery", END]:
     """After error handling: retry or give up."""
     error = state.get("error")
     if error:
         # Error still present → couldn't recover → END
         return END
+
+    decision = state.get("active_recovery_decision") or {}
+    next_node = decision.get("next_node")
+    if next_node == TASK_PLANNER:
+        return TASK_PLANNER
+    if next_node == STATE_RECOVERY:
+        return STATE_RECOVERY
+    if next_node == LLM_REASON:
+        return LLM_REASON
 
     retry_count = state.get("retry_count", 0)
     if retry_count > 0:

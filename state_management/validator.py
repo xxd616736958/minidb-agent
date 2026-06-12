@@ -109,6 +109,23 @@ class StateValidator:
         if working_set.get("stale_reason"):
             warnings.append(f"db_working_set is stale: {working_set.get('stale_reason')}")
 
+        error_ids = {item.get("id") for item in state.get("error_records", [])}
+        for decision in state.get("recovery_decisions", []):
+            error_id = decision.get("error_id")
+            if error_id and error_id not in error_ids:
+                warnings.append(f"recovery decision '{decision.get('id')}' references missing error '{error_id}'.")
+                repair_actions.append("Regenerate recovery decision from current ErrorRecord.")
+
+        active_decision = state.get("active_recovery_decision") or {}
+        if active_decision and active_decision.get("error_id") not in error_ids:
+            warnings.append("active_recovery_decision references a missing ErrorRecord.")
+            repair_actions.append("Clear active_recovery_decision or regenerate it from latest ErrorRecord.")
+        if active_decision.get("action") == "auto_retry":
+            for budget in state.get("retry_budgets", []):
+                if budget.get("last_error_id") == active_decision.get("error_id") and budget.get("exhausted"):
+                    errors.append("active_recovery_decision requests auto_retry but retry budget is exhausted.")
+                    repair_actions.append("Switch recovery decision to ask_user, replan_step, or abort_safely.")
+
         return {
             "ok": not errors,
             "errors": errors,

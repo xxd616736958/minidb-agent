@@ -283,6 +283,8 @@ def print_loop_status(label: str, payload: dict[str, Any]):
                 f"[dim]↳ Artifact:[/dim] [cyan]{artifact.get('kind')}[/cyan] "
                 f"{str(artifact.get('summary', ''))[:100]}"
             )
+    elif label == "error_handler":
+        _print_state_runtime(payload)
 
     written_memories = payload.get("memory_records_written") or []
     for memory in written_memories:
@@ -291,6 +293,7 @@ def print_loop_status(label: str, payload: dict[str, Any]):
             f"{str(memory.get('summary', ''))[:100]}"
         )
 
+    _print_error_recovery(payload)
     _print_collaboration_events(payload)
 
 
@@ -413,6 +416,43 @@ def _print_collaboration_events(payload: dict[str, Any]) -> None:
         f"[cyan]{latest.get('event_type')}[/cyan] "
         f"{str(latest.get('summary', ''))[:120]}"
     )
+
+
+def _print_error_recovery(payload: dict[str, Any]) -> None:
+    errors = payload.get("error_records") or []
+    decisions = payload.get("recovery_decisions") or []
+    budgets = payload.get("retry_budgets") or []
+    reports = payload.get("error_reports") or []
+    if errors:
+        latest = errors[-1]
+        console.print(
+            "[dim]Error:[/dim] "
+            f"[cyan]{latest.get('error_type')}[/cyan] "
+            f"step={latest.get('step_id') or 'none'} "
+            f"tool={latest.get('tool_name') or 'none'} "
+            f"{str(latest.get('message', ''))[:100]}"
+        )
+    if decisions:
+        latest_decision = decisions[-1]
+        console.print(
+            "[dim]Recovery:[/dim] "
+            f"[cyan]{latest_decision.get('action')}[/cyan] "
+            f"{str(latest_decision.get('reason', ''))[:120]}"
+        )
+    if budgets:
+        latest_budget = budgets[-1]
+        console.print(
+            "[dim]Retry budget:[/dim] "
+            f"{latest_budget.get('attempts')}/{latest_budget.get('max_attempts')} "
+            f"exhausted={latest_budget.get('exhausted')}"
+        )
+    if reports:
+        latest_report = reports[-1]
+        console.print(
+            "[dim]Error report:[/dim] "
+            f"[cyan]{latest_report.get('status')}[/cyan] "
+            f"{str(latest_report.get('user_summary', ''))[:120]}"
+        )
 
 
 def print_session_info(session_id: str, model: str, tools_count: int):

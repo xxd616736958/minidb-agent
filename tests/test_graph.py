@@ -18,6 +18,8 @@ from agent.edges.routes import (
     WORKFLOW_PLANNER,
     TOOL_POLICY_GATE,
     LLM_REASON,
+    STATE_RECOVERY,
+    TASK_PLANNER,
     HUMAN_APPROVAL,
     EXECUTE_TOOLS,
     ERROR_HANDLER,
@@ -208,6 +210,25 @@ class TestRouting:
         # Error cleared (handler should do this), but retry count set → retry
         result = route_after_error_handler(state)
         assert result == LLM_REASON
+
+    def test_route_after_error_handler_uses_structured_next_node(self):
+        state = self._make_state(
+            active_recovery_decision={
+                "id": "recovery-1",
+                "error_id": "err-1",
+                "action": "replan_step",
+                "reason": "Need replanning",
+                "confidence": 0.8,
+                "safety_notes": [],
+                "requires_new_approval": False,
+                "next_node": TASK_PLANNER,
+                "created_at": "now",
+            }
+        )
+        assert route_after_error_handler(state) == TASK_PLANNER
+
+        state["active_recovery_decision"]["next_node"] = STATE_RECOVERY
+        assert route_after_error_handler(state) == STATE_RECOVERY
 
     def test_route_after_error_handler_no_retry_needed(self):
         """No error, no retry count → END."""
