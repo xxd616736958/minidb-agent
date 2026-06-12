@@ -294,6 +294,7 @@ def print_loop_status(label: str, payload: dict[str, Any]):
         )
 
     _print_error_recovery(payload)
+    _print_quality(payload)
     _print_collaboration_events(payload)
 
 
@@ -452,6 +453,37 @@ def _print_error_recovery(payload: dict[str, Any]) -> None:
             "[dim]Error report:[/dim] "
             f"[cyan]{latest_report.get('status')}[/cyan] "
             f"{str(latest_report.get('user_summary', ''))[:120]}"
+        )
+
+
+def _print_quality(payload: dict[str, Any]) -> None:
+    gates = payload.get("quality_gates") or []
+    evaluations = payload.get("evaluation_results") or []
+    reports = payload.get("quality_reports") or []
+    if gates:
+        latest = gates[-1]
+        failed = latest.get("failed_checks") or []
+        console.print(
+            "[dim]Quality gate:[/dim] "
+            f"[cyan]{latest.get('gate_type')}[/cyan] "
+            f"{latest.get('status')} blocking={latest.get('blocking')} "
+            f"{str(failed[:2])[:100]}"
+        )
+    if evaluations:
+        latest_eval = evaluations[-1]
+        console.print(
+            "[dim]Evaluation:[/dim] "
+            f"[cyan]{latest_eval.get('case_id')}[/cyan] "
+            f"{latest_eval.get('status')} "
+            f"{str(latest_eval.get('summary', ''))[:100]}"
+        )
+    if reports:
+        latest_report = reports[-1]
+        console.print(
+            "[dim]Quality report:[/dim] "
+            f"[cyan]{latest_report.get('scope')}[/cyan] "
+            f"{latest_report.get('status')} "
+            f"review={latest_report.get('human_review_required')}"
         )
 
 

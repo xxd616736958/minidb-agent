@@ -451,6 +451,97 @@ class ErrorReport(TypedDict):
     created_at: str
 
 
+class QualityGate(TypedDict):
+    """Structured quality gate for task, safety, tool, CI, or review checks."""
+
+    id: str
+    gate_type: Literal[
+        "task_completion",
+        "tool_contract",
+        "safety_regression",
+        "state_integrity",
+        "error_recovery",
+        "report_quality",
+        "ci",
+        "human_review",
+    ]
+    target_ref: str
+    required_checks: list[str]
+    passed_checks: list[str]
+    failed_checks: list[str]
+    status: Literal["pending", "passed", "failed", "waived"]
+    blocking: bool
+    created_at: str
+
+
+class EvaluationCase(TypedDict):
+    """Standard task-level evaluation case for agent behavior."""
+
+    id: str
+    category: Literal[
+        "intent",
+        "planning",
+        "tool_use",
+        "safety",
+        "postgresql_task",
+        "error_recovery",
+        "reporting",
+    ]
+    user_input: str
+    initial_state: dict[str, Any]
+    expected_state_assertions: list[dict[str, Any]]
+    expected_output_assertions: list[dict[str, Any]]
+    forbidden_actions: list[str]
+    allowed_tools: list[str]
+    required_evidence: list[str]
+    tags: list[str]
+
+
+class EvaluationResult(TypedDict):
+    """Structured result for one EvaluationCase."""
+
+    id: str
+    case_id: str
+    status: Literal["passed", "failed", "needs_review"]
+    scores: dict[str, float]
+    failed_assertions: list[str]
+    evidence_refs: list[str]
+    safety_blocked: bool
+    requires_human_review: bool
+    summary: str
+    created_at: str
+
+
+class ReplayCase(TypedDict):
+    """Replayable task case derived from failures, feedback, or incidents."""
+
+    id: str
+    source: Literal["manual", "failed_task", "user_feedback", "production_incident"]
+    input_messages: list[dict[str, Any]]
+    state_snapshot_ref: Optional[str]
+    tool_invocation_refs: list[str]
+    expected_recovery: Optional[str]
+    expected_final_status: str
+    sensitivity: Literal["public", "internal", "sensitive"]
+    created_at: str
+
+
+class QualityReport(TypedDict):
+    """Human-readable and auditable quality summary."""
+
+    id: str
+    target_ref: str
+    scope: Literal["task", "module", "release", "ci_run", "replay_suite"]
+    status: Literal["passed", "failed", "needs_review"]
+    test_summary: dict[str, Any]
+    evaluation_summary: dict[str, Any]
+    safety_summary: dict[str, Any]
+    uncovered_risks: list[str]
+    human_review_required: bool
+    recommendations: list[str]
+    created_at: str
+
+
 class StepContextPacket(TypedDict):
     """Current-step context packet injected into LLM and policy gates."""
 
@@ -1000,6 +1091,11 @@ class AgentState(TypedDict):
     state_repair_actions: NotRequired[Annotated[list[StateRepairAction], operator.add]]
     error_reports: NotRequired[Annotated[list[ErrorReport], operator.add]]
     active_recovery_decision: NotRequired[Optional[RecoveryDecision]]
+    quality_gates: NotRequired[Annotated[list[QualityGate], operator.add]]
+    evaluation_cases: NotRequired[Annotated[list[EvaluationCase], operator.add]]
+    evaluation_results: NotRequired[Annotated[list[EvaluationResult], operator.add]]
+    replay_cases: NotRequired[Annotated[list[ReplayCase], operator.add]]
+    quality_reports: NotRequired[Annotated[list[QualityReport], operator.add]]
 
     # Human-readable plan summary injected into system prompt.
     plan: Optional[str]

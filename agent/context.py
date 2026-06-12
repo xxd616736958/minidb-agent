@@ -610,6 +610,64 @@ def build_prompt_context(state: AgentState) -> tuple[str, StepContextPacket | No
             )
         )
 
+    quality_gates = state.get("quality_gates", [])[-5:]
+    evaluation_results = state.get("evaluation_results", [])[-5:]
+    replay_cases = state.get("replay_cases", [])[-3:]
+    quality_reports = state.get("quality_reports", [])[-3:]
+    if quality_gates or evaluation_results or replay_cases or quality_reports:
+        sections.append(
+            "## Evaluation Testing and Quality Control\n"
+            + json.dumps(
+                {
+                    "recent_quality_gates": [
+                        {
+                            "id": item.get("id"),
+                            "gate_type": item.get("gate_type"),
+                            "target_ref": item.get("target_ref"),
+                            "status": item.get("status"),
+                            "blocking": item.get("blocking"),
+                            "failed_checks": item.get("failed_checks", []),
+                        }
+                        for item in quality_gates
+                    ],
+                    "recent_evaluation_results": [
+                        {
+                            "id": item.get("id"),
+                            "case_id": item.get("case_id"),
+                            "status": item.get("status"),
+                            "scores": item.get("scores", {}),
+                            "failed_assertions": item.get("failed_assertions", []),
+                            "requires_human_review": item.get("requires_human_review"),
+                        }
+                        for item in evaluation_results
+                    ],
+                    "recent_replay_cases": [
+                        {
+                            "id": item.get("id"),
+                            "source": item.get("source"),
+                            "expected_recovery": item.get("expected_recovery"),
+                            "expected_final_status": item.get("expected_final_status"),
+                            "sensitivity": item.get("sensitivity"),
+                        }
+                        for item in replay_cases
+                    ],
+                    "recent_quality_reports": [
+                        {
+                            "id": item.get("id"),
+                            "scope": item.get("scope"),
+                            "status": item.get("status"),
+                            "human_review_required": item.get("human_review_required"),
+                            "uncovered_risks": item.get("uncovered_risks", []),
+                            "recommendations": item.get("recommendations", []),
+                        }
+                        for item in quality_reports
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+
     query = build_memory_query(state)
     memories = state.get("retrieved_memories")
     if memories is None:

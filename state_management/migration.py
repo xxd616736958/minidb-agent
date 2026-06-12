@@ -44,6 +44,11 @@ class StateMigration:
             "retry_budgets": [],
             "state_repair_actions": [],
             "error_reports": [],
+            "quality_gates": [],
+            "evaluation_cases": [],
+            "evaluation_results": [],
+            "replay_cases": [],
+            "quality_reports": [],
         }
         for key, value in defaults.items():
             if key not in state:
