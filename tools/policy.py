@@ -49,8 +49,16 @@ def is_postgres_tool(tool_name: str) -> bool:
 
 
 def is_write_call(tool_call: dict[str, Any], spec: RegisteredToolSpec | None = None) -> bool:
-    if spec and spec["capability"].get("read_only") is False:
-        return True
+    if spec:
+        capability = spec["capability"]
+        operation_type = capability.get("operation_type")
+        return bool(capability.get("destructive")) or operation_type in {
+            "data_change",
+            "schema_change",
+            "permission_change",
+            "backup_restore",
+            "maintenance",
+        }
     name = str(tool_call.get("name", ""))
     text = tool_args_text(tool_call)
     return is_postgres_tool(name) and bool(WRITE_SQL_RE.search(text))

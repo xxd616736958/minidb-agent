@@ -13,6 +13,8 @@ setup(
         "langchain-core>=0.3.0",
         "langchain-openai>=0.2.0",
         "pydantic>=2.10.0",
+        "psycopg[binary]>=3.2.0",
+        "pglast>=6.0",
         "langsmith>=0.2.0",
     ],
 )

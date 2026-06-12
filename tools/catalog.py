@@ -14,6 +14,8 @@ PHASES = {"clarify", "observe", "diagnose", "propose", "approve", "execute", "ve
 POLICIES = {"no_tools", "read_only_tools", "write_tools_after_approval"}
 RISK_ORDER = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 WRITE_TOOL_HINT_RE = re.compile(r"(write|execute|shell|delete|drop|alter|grant|revoke)", re.IGNORECASE)
+POSTGRES_READ_ALIASES = {"postgres_read", "postgres_readonly", "postgres_query", "postgres_observe"}
+POSTGRES_WRITE_ALIASES = {"postgres_write", "postgres_execute", "postgres_execute_write"}
 
 
 def _schema_dict(tool: BaseTool) -> dict[str, Any]:
@@ -193,8 +195,13 @@ def spec_allowed_for_state(spec: RegisteredToolSpec, state: AgentState) -> bool:
         return False
 
     if expected_tools and name not in expected_tools:
-        if capability["domain"] == "postgresql" or capability["risk_level"] in {"high", "critical"}:
-            return False
+        if capability["domain"] == "postgresql" and capability["read_only"] and expected_tools & POSTGRES_READ_ALIASES:
+            pass
+        elif capability["domain"] == "postgresql" and not capability["read_only"] and expected_tools & POSTGRES_WRITE_ALIASES:
+            pass
+        else:
+            if capability["domain"] == "postgresql" or capability["risk_level"] in {"high", "critical"}:
+                return False
 
     if policy == "read_only_tools":
         return bool(capability["read_only"])

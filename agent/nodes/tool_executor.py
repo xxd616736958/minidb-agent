@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from langchain_core.messages import ToolMessage
 
 from agent.state import AgentState
+from tools.postgres.results import loads_result
 from tools.registry import registry
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,22 @@ def _tool_execution_result(msg: ToolMessage, started_at: datetime) -> dict[str, 
     content = str(getattr(msg, "content", ""))
     name = str(getattr(msg, "name", "tool"))
     duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
+    structured = loads_result(content)
+    if structured:
+        return {
+            "tool_call_id": str(getattr(msg, "tool_call_id", "")),
+            "tool_name": structured.get("tool_name") or name,
+            "success": structured.get("success", False),
+            "result_type": structured.get("result_type", "tool_error"),
+            "summary": structured.get("summary", "")[:300],
+            "payload": structured.get("payload", {}),
+            "row_count": structured.get("row_count"),
+            "affected_rows": structured.get("affected_rows"),
+            "sqlstate": structured.get("sqlstate"),
+            "duration_ms": structured.get("duration_ms") or duration_ms,
+            "truncated": structured.get("truncated", False),
+            "sensitive_fields_masked": structured.get("sensitive_fields_masked", []),
+        }
     result_type = _result_type(name, content)
     success = result_type not in {"sql_error", "tool_error", "policy_denied"} and not content.lower().startswith("error")
     return {
