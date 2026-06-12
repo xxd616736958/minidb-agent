@@ -567,6 +567,13 @@ class QualityManager:
         )
         if high_risk_routes and not high_risk_review_ok:
             uncovered_risks.append("high_risk_model_route_not_review_tier")
+        delivery_packages = self.state.get("delivery_packages", [])
+        delivery_gates = [gate for gate in gates if gate.get("gate_type") == "delivery_quality"]
+        blocked_deliveries = [package for package in delivery_packages if package.get("status") in {"blocked", "failed"}]
+        if self.state.get("loop_status") in {"completed", "blocked"} and not delivery_packages:
+            uncovered_risks.append("delivery_package_not_generated")
+        if delivery_packages and not delivery_gates:
+            uncovered_risks.append("delivery_quality_not_run")
         return {
             "id": _new_id("quality-report"),
             "target_ref": target_ref,
@@ -596,6 +603,13 @@ class QualityManager:
                 "high_risk_routes": len(high_risk_routes),
                 "high_risk_review_model_ok": high_risk_review_ok,
                 "estimated_cost": round(sum(float(item.get("cost_estimate") or 0.0) for item in model_records), 6),
+            },
+            "delivery_summary": {
+                "delivery_packages": len(delivery_packages),
+                "blocked_deliveries": len(blocked_deliveries),
+                "ready_deliveries": len([item for item in delivery_packages if item.get("status") in {"ready", "delivered"}]),
+                "delivery_quality_gates": len(delivery_gates),
+                "latest_package_status": (delivery_packages[-1] or {}).get("status") if delivery_packages else None,
             },
             "uncovered_risks": uncovered_risks,
             "human_review_required": human_review_required,

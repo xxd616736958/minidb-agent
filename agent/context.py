@@ -755,6 +755,55 @@ def build_prompt_context(state: AgentState) -> tuple[str, StepContextPacket | No
             )
         )
 
+    delivery_contracts = state.get("delivery_contracts", [])[-3:]
+    artifact_manifests = state.get("artifact_manifests", [])[-3:]
+    delivery_packages = state.get("delivery_packages", [])[-3:]
+    if delivery_contracts or artifact_manifests or delivery_packages:
+        sections.append(
+            "## Artifact Generation and Delivery\n"
+            + json.dumps(
+                {
+                    "recent_contracts": [
+                        {
+                            "id": item.get("id"),
+                            "delivery_mode": item.get("delivery_mode"),
+                            "required_items": item.get("required_items", []),
+                            "requires_sql_package": item.get("requires_sql_package"),
+                            "requires_approval_evidence": item.get("requires_approval_evidence"),
+                            "requires_verification": item.get("requires_verification"),
+                            "status": item.get("status"),
+                        }
+                        for item in delivery_contracts
+                    ],
+                    "recent_manifests": [
+                        {
+                            "id": item.get("id"),
+                            "task_id": item.get("task_id"),
+                            "artifact_ids": item.get("artifact_ids", []),
+                            "evidence_count": len(item.get("evidence_refs", []) or []),
+                            "sql_count": len(item.get("sql_items", []) or []),
+                            "report_paths": item.get("report_paths", []),
+                            "missing_items": item.get("missing_items", []),
+                        }
+                        for item in artifact_manifests
+                    ],
+                    "recent_packages": [
+                        {
+                            "id": item.get("id"),
+                            "status": item.get("status"),
+                            "summary": item.get("summary"),
+                            "user_report_path": item.get("user_report_path"),
+                            "audit_report_path": item.get("audit_report_path"),
+                            "next_actions": item.get("next_actions", []),
+                        }
+                        for item in delivery_packages
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+
     quality_gates = state.get("quality_gates", [])[-5:]
     evaluation_results = state.get("evaluation_results", [])[-5:]
     replay_cases = state.get("replay_cases", [])[-3:]

@@ -205,6 +205,38 @@ class StateValidator:
                 errors.append(f"model fallback '{fallback.get('id')}' attempted disallowed downshift.")
                 repair_actions.append("Fail closed or request user input for high-risk model fallback.")
 
+        contract_ids = {contract.get("id") for contract in state.get("delivery_contracts", [])}
+        manifest_ids = {manifest.get("id") for manifest in state.get("artifact_manifests", [])}
+        delivery_artifact_ids = {artifact.get("id") for artifact in state.get("artifact_records", [])}
+        for package in state.get("delivery_packages", []):
+            package_id = package.get("id")
+            if package.get("contract_id") and contract_ids and package.get("contract_id") not in contract_ids:
+                errors.append(f"delivery package '{package_id}' references missing contract '{package.get('contract_id')}'.")
+                repair_actions.append("Regenerate delivery package from active DeliveryContract.")
+            if package.get("manifest_id") and manifest_ids and package.get("manifest_id") not in manifest_ids:
+                errors.append(f"delivery package '{package_id}' references missing manifest '{package.get('manifest_id')}'.")
+                repair_actions.append("Regenerate ArtifactManifest before delivery package.")
+            if package.get("status") in {"ready", "delivered"} and not package.get("user_report_path"):
+                errors.append(f"delivery package '{package_id}' is ready but has no user_report_path.")
+                repair_actions.append("Regenerate final report and attach report path.")
+            for artifact_id in package.get("artifact_ids", []) or []:
+                if delivery_artifact_ids and artifact_id not in delivery_artifact_ids:
+                    warnings.append(f"delivery package '{package_id}' references missing artifact '{artifact_id}'.")
+                    repair_actions.append("Attach delivery artifacts to artifact_records.")
+
+        for manifest in state.get("artifact_manifests", []):
+            if manifest.get("missing_items") and any(package.get("manifest_id") == manifest.get("id") and package.get("status") == "ready" for package in state.get("delivery_packages", [])):
+                warnings.append(f"artifact manifest '{manifest.get('id')}' has missing items but package is ready.")
+                repair_actions.append("Run delivery_quality gate before marking package ready.")
+            for sql_item in manifest.get("sql_items", []) or []:
+                classification = sql_item.get("classification")
+                if classification in {"data_change", "schema_change", "permission_change", "maintenance", "transaction_control"} and not sql_item.get("approval_id"):
+                    errors.append(f"SQL delivery item '{sql_item.get('id')}' is write-classified but has no approval.")
+                    repair_actions.append("Bind SQL delivery item to ApprovalDecision or block delivery.")
+                if sql_item.get("sql_preview") and not sql_item.get("sql_hash"):
+                    errors.append(f"SQL delivery item '{sql_item.get('id')}' has SQL preview but no hash.")
+                    repair_actions.append("Compute sql_hash before delivery.")
+
         return {
             "ok": not errors,
             "errors": errors,

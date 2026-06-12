@@ -24,6 +24,7 @@ from agent.edges.routes import (
     HUMAN_APPROVAL,
     EXECUTE_TOOLS,
     ERROR_HANDLER,
+    FINAL_REPORT,
     MEMORY_COMPACTOR,
     DELEGATION_PLANNER,
     STEP_SCHEDULER,
@@ -118,12 +119,12 @@ class TestRouting:
         return state
 
     def test_route_after_llm_no_tool_calls(self):
-        """No tool calls + no error → END."""
+        """No tool calls + no error → final_report."""
         from langchain_core.messages import AIMessage
         state = self._make_state(
             messages=[AIMessage(content="Hello!")],
         )
-        assert route_after_llm(state) == END
+        assert route_after_llm(state) == FINAL_REPORT
 
     def test_route_after_llm_with_tool_calls(self):
         """Tool calls → tool_policy_gate."""
@@ -243,6 +244,6 @@ class TestRouting:
         assert route_after_error_handler(state) == STATE_RECOVERY
 
     def test_route_after_error_handler_no_retry_needed(self):
-        """No error, no retry count → END."""
+        """No error, no retry count → final_report."""
         state = self._make_state(retry_count=0)
-        assert route_after_error_handler(state) == END
+        assert route_after_error_handler(state) == FINAL_REPORT

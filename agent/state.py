@@ -467,6 +467,7 @@ class QualityGate(TypedDict):
         "delegation_result",
         "model_routing",
         "model_output_quality",
+        "delivery_quality",
     ]
     target_ref: str
     required_checks: list[str]
@@ -541,10 +542,125 @@ class QualityReport(TypedDict):
     evaluation_summary: dict[str, Any]
     safety_summary: dict[str, Any]
     model_summary: NotRequired[dict[str, Any]]
+    delivery_summary: NotRequired[dict[str, Any]]
     uncovered_risks: list[str]
     human_review_required: bool
     recommendations: list[str]
     created_at: str
+
+
+class DeliveryContract(TypedDict):
+    """Task-level contract describing what must be delivered to the user."""
+
+    id: str
+    intent_id: str
+    plan_id: Optional[str]
+    audience: Literal["developer", "dba", "operator", "auditor", "general"]
+    delivery_mode: Literal["chat_summary", "artifact_package", "approval_package", "audit_package"]
+    required_items: list[str]
+    optional_items: list[str]
+    required_evidence_types: list[str]
+    requires_sql_package: bool
+    requires_approval_evidence: bool
+    requires_rollback_plan: bool
+    requires_verification: bool
+    output_formats: list[Literal["markdown", "json", "sql", "text"]]
+    sensitivity: Literal["public", "internal", "sensitive", "secret"]
+    status: Literal["draft", "ready", "blocked", "delivered"]
+    created_at: str
+    updated_at: str
+
+
+class EvidenceReference(TypedDict):
+    """Reference from a report claim to structured task evidence."""
+
+    id: str
+    source_type: Literal[
+        "db_observation",
+        "tool_result",
+        "artifact",
+        "approval",
+        "verification",
+        "quality_gate",
+        "model_record",
+        "error_report",
+    ]
+    source_id: str
+    summary: str
+    supports_claim: str
+    sensitivity: Literal["public", "internal", "sensitive", "secret"]
+
+
+class SQLDeliveryItem(TypedDict):
+    """Deliverable SQL item with safety, approval, and execution metadata."""
+
+    id: str
+    purpose: Literal["diagnostic", "change", "rollback", "verification", "dry_run"]
+    sql_preview: str
+    sql_hash: str
+    classification: str
+    risk_level: str
+    target_environment: str
+    approval_id: Optional[str]
+    safety_report_id: Optional[str]
+    execution_record_id: Optional[str]
+    verification_refs: list[str]
+    status: Literal["draft", "approved", "executed", "verified", "blocked"]
+
+
+class ReportSection(TypedDict):
+    """Structured report section with evidence references."""
+
+    id: str
+    title: str
+    purpose: Literal[
+        "summary",
+        "evidence",
+        "diagnosis",
+        "recommendation",
+        "risk",
+        "approval",
+        "execution",
+        "verification",
+        "rollback",
+        "next_steps",
+    ]
+    content: str
+    evidence_refs: list[str]
+    status: Literal["complete", "missing_evidence", "not_applicable"]
+
+
+class ArtifactManifest(TypedDict):
+    """Task-level manifest linking artifacts, evidence, SQL items, and reports."""
+
+    id: str
+    task_id: str
+    artifact_ids: list[str]
+    evidence_refs: list[EvidenceReference]
+    sql_items: list[SQLDeliveryItem]
+    report_paths: list[str]
+    missing_items: list[str]
+    sensitivity: Literal["public", "internal", "sensitive", "secret"]
+    created_at: str
+
+
+class DeliveryPackage(TypedDict):
+    """User and audit-facing package for final task delivery."""
+
+    id: str
+    task_id: str
+    contract_id: str
+    title: str
+    status: Literal["draft", "ready", "blocked", "delivered", "failed"]
+    summary: str
+    user_report_path: Optional[str]
+    audit_report_path: Optional[str]
+    manifest_id: str
+    artifact_ids: list[str]
+    quality_gate_ids: list[str]
+    next_actions: list[str]
+    created_at: str
+    delivered_at: Optional[str]
 
 
 class AgentRoleDefinition(TypedDict):
@@ -926,6 +1042,14 @@ class ArtifactRecord(TypedDict):
         "execution_log",
         "verification_evidence",
         "final_report",
+        "diagnostic_report",
+        "sql_change_package",
+        "approval_package",
+        "rollback_package",
+        "verification_report",
+        "blocked_report",
+        "audit_report",
+        "delivery_manifest",
     ]
     path: Optional[str]
     payload_ref: Optional[str]
@@ -1357,6 +1481,13 @@ class AgentState(TypedDict):
     evaluation_results: NotRequired[Annotated[list[EvaluationResult], operator.add]]
     replay_cases: NotRequired[Annotated[list[ReplayCase], operator.add]]
     quality_reports: NotRequired[Annotated[list[QualityReport], operator.add]]
+    delivery_contracts: NotRequired[Annotated[list[DeliveryContract], operator.add]]
+    active_delivery_contract: NotRequired[Optional[DeliveryContract]]
+    artifact_manifests: NotRequired[Annotated[list[ArtifactManifest], operator.add]]
+    delivery_packages: NotRequired[Annotated[list[DeliveryPackage], operator.add]]
+    report_sections: NotRequired[Annotated[list[ReportSection], operator.add]]
+    sql_delivery_items: NotRequired[Annotated[list[SQLDeliveryItem], operator.add]]
+    evidence_references: NotRequired[Annotated[list[EvidenceReference], operator.add]]
     agent_roles: NotRequired[list[AgentRoleDefinition]]
     delegation_policy_decisions: NotRequired[Annotated[list[DelegationPolicyDecision], operator.add]]
     delegated_tasks: NotRequired[Annotated[list[DelegatedTask], operator.add]]

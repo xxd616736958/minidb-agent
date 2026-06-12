@@ -30,6 +30,7 @@ from agent.edges.routes import (
     HUMAN_APPROVAL,
     NORMALIZE_OBSERVATION,
     ERROR_HANDLER,
+    FINAL_REPORT,
     MEMORY_COMPACTOR,
     STEP_SCHEDULER,
     TASK_PLANNER,
@@ -60,6 +61,7 @@ from agent.nodes.agent_loop import (
 )
 from agent.nodes.delegation_planner import delegation_planner
 from agent.nodes.error_handler import error_handler
+from agent.nodes.final_report import final_report
 from agent.nodes.human_approval import human_approval
 from agent.nodes.intent import (
     clarification_gate,
@@ -121,6 +123,7 @@ def build_graph() -> StateGraph:
     builder.add_node(NORMALIZE_OBSERVATION, normalize_observation)
     builder.add_node(VERIFY_STEP, verify_step)
     builder.add_node(ERROR_HANDLER, error_handler)
+    builder.add_node(FINAL_REPORT, final_report)
 
     # ── Add edges ────────────────────────────────────────
 
@@ -199,7 +202,7 @@ def build_graph() -> StateGraph:
         {
             "memory_compactor": MEMORY_COMPACTOR,
             "error_handler": ERROR_HANDLER,
-            END: END,
+            "final_report": FINAL_REPORT,
         },
     )
 
@@ -221,7 +224,7 @@ def build_graph() -> StateGraph:
             "tool_policy_gate": TOOL_POLICY_GATE,
             "verify_step": VERIFY_STEP,
             "error_handler": ERROR_HANDLER,
-            END: END,
+            "final_report": FINAL_REPORT,
         },
     )
 
@@ -282,9 +285,13 @@ def build_graph() -> StateGraph:
         route_after_error_handler,
         {
             "llm_reason": LLM_REASON,
-            END: END,
+            "task_planner": TASK_PLANNER,
+            "state_recovery": STATE_RECOVERY,
+            "final_report": FINAL_REPORT,
         },
     )
+
+    builder.add_edge(FINAL_REPORT, END)
 
     # ── Compile ──────────────────────────────────────────
     # LangGraph API platform handles persistence automatically.

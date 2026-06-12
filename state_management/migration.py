@@ -49,6 +49,12 @@ class StateMigration:
             "evaluation_results": [],
             "replay_cases": [],
             "quality_reports": [],
+            "delivery_contracts": [],
+            "artifact_manifests": [],
+            "delivery_packages": [],
+            "report_sections": [],
+            "sql_delivery_items": [],
+            "evidence_references": [],
             "agent_roles": [],
             "delegation_policy_decisions": [],
             "delegated_tasks": [],
@@ -73,6 +79,7 @@ class StateMigration:
             "plan_review": None,
             "approval_card": None,
             "active_recovery_decision": None,
+            "active_delivery_contract": None,
         }
         for key, value in nullable_defaults.items():
             if key not in state:

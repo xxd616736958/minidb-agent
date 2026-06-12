@@ -32,6 +32,7 @@ EXECUTE_TOOLS = "execute_tools"
 NORMALIZE_OBSERVATION = "normalize_observation"
 VERIFY_STEP = "verify_step"
 ERROR_HANDLER = "error_handler"
+FINAL_REPORT = "final_report"
 END = "__end__"
 
 
@@ -112,12 +113,12 @@ def route_after_delegation_planner(
 
 def route_after_scheduler(
     state: AgentState,
-) -> Literal["memory_compactor", "error_handler", END]:
+) -> Literal["memory_compactor", "error_handler", "final_report"]:
     """After step scheduling: continue, handle blocked state, or finish."""
     if state.get("error"):
         return ERROR_HANDLER
     if state.get("loop_status") == "completed":
-        return END
+        return FINAL_REPORT
     if state.get("loop_status") == "blocked":
         return ERROR_HANDLER
     return MEMORY_COMPACTOR
@@ -134,7 +135,7 @@ def route_after_compactor(
 
 def route_after_llm(
     state: AgentState,
-) -> Literal["tool_policy_gate", "verify_step", "error_handler", END]:
+) -> Literal["tool_policy_gate", "verify_step", "error_handler", "final_report"]:
     """After LLM response: route based on content.
 
     - tool_calls → tool_policy_gate
@@ -149,7 +150,7 @@ def route_after_llm(
     messages = state.get("messages", [])
     if not messages:
         logger.debug("No messages after LLM → END")
-        return END
+        return FINAL_REPORT
 
     last_msg = messages[-1]
     tool_calls = getattr(last_msg, "tool_calls", None)
@@ -163,7 +164,7 @@ def route_after_llm(
         return VERIFY_STEP
 
     logger.debug("No tool calls, no pending tasks → END (final answer)")
-    return END
+    return FINAL_REPORT
 
 
 def route_after_policy_gate(
@@ -237,12 +238,12 @@ def route_after_verify(
 
 def route_after_error_handler(
     state: AgentState,
-) -> Literal["llm_reason", "task_planner", "state_recovery", END]:
+) -> Literal["llm_reason", "task_planner", "state_recovery", "final_report"]:
     """After error handling: retry or give up."""
     error = state.get("error")
     if error:
         # Error still present → couldn't recover → END
-        return END
+        return FINAL_REPORT
 
     decision = state.get("active_recovery_decision") or {}
     next_node = decision.get("next_node")
@@ -260,4 +261,4 @@ def route_after_error_handler(
         return LLM_REASON
 
     # Error cleared but no retry needed (was handled inline)
-    return END
+    return FINAL_REPORT

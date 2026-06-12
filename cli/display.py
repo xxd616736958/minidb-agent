@@ -285,6 +285,9 @@ def print_loop_status(label: str, payload: dict[str, Any]):
             )
     elif label == "error_handler":
         _print_state_runtime(payload)
+    elif label == "final_report":
+        _print_state_runtime(payload)
+        _print_delivery(payload)
 
     written_memories = payload.get("memory_records_written") or []
     for memory in written_memories:
@@ -296,6 +299,7 @@ def print_loop_status(label: str, payload: dict[str, Any]):
     _print_error_recovery(payload)
     _print_delegation(payload)
     _print_model_routing(payload)
+    _print_delivery(payload)
     _print_quality(payload)
     _print_collaboration_events(payload)
 
@@ -563,6 +567,39 @@ def _print_model_routing(payload: dict[str, Any]) -> None:
             "[dim]Model fallback:[/dim] "
             f"[cyan]{latest_fallback.get('decision')}[/cyan] "
             f"{latest_fallback.get('from_model_id')} -> {latest_fallback.get('to_model_id') or 'none'}"
+        )
+
+
+def _print_delivery(payload: dict[str, Any]) -> None:
+    packages = payload.get("delivery_packages") or []
+    manifests = payload.get("artifact_manifests") or []
+    contracts = payload.get("delivery_contracts") or []
+    if contracts:
+        latest_contract = contracts[-1]
+        console.print(
+            "[dim]Delivery contract:[/dim] "
+            f"[cyan]{latest_contract.get('delivery_mode')}[/cyan] "
+            f"required={len(latest_contract.get('required_items') or [])} "
+            f"status={latest_contract.get('status')}"
+        )
+    if manifests:
+        latest_manifest = manifests[-1]
+        console.print(
+            "[dim]Delivery manifest:[/dim] "
+            f"[cyan]{latest_manifest.get('id')}[/cyan] "
+            f"evidence={len(latest_manifest.get('evidence_refs') or [])} "
+            f"sql={len(latest_manifest.get('sql_items') or [])} "
+            f"missing={', '.join(str(item) for item in (latest_manifest.get('missing_items') or [])[:3]) or 'none'}"
+        )
+    if packages:
+        latest_package = packages[-1]
+        report = latest_package.get("user_report_path") or "no-report"
+        actions = latest_package.get("next_actions") or []
+        console.print(
+            "[dim]Delivery package:[/dim] "
+            f"[cyan]{latest_package.get('status')}[/cyan] "
+            f"{str(latest_package.get('title') or '')[:80]} "
+            f"[dim]report={report} next={', '.join(str(item) for item in actions[:3])}[/dim]"
         )
 
 
