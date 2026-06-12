@@ -254,6 +254,63 @@ class ContextSnapshot(TypedDict):
     created_at: str
 
 
+class MemoryRecord(TypedDict):
+    """Safe, scoped long-term memory record."""
+
+    id: str
+    kind: Literal[
+        "fact",
+        "preference",
+        "experience",
+        "assumption",
+        "prohibition",
+        "schema_summary",
+        "task_episode",
+    ]
+    scope: Literal["user", "project", "database", "schema", "session", "task"]
+    namespace: str
+    summary: str
+    payload: dict[str, Any]
+    source: Literal[
+        "user_confirmed",
+        "tool_observed",
+        "agent_inferred",
+        "report_generated",
+        "system_policy",
+    ]
+    evidence_refs: list[str]
+    confidence: float
+    sensitivity: Literal["public", "internal", "sensitive", "secret"]
+    ttl_seconds: Optional[int]
+    observed_at: str
+    expires_at: Optional[str]
+    supersedes: list[str]
+    status: Literal["active", "deprecated", "expired", "conflicted"]
+
+
+class MemoryCandidate(TypedDict):
+    """Candidate long-term memory generated from verified task state."""
+
+    id: str
+    proposed_record: MemoryRecord
+    reason: str
+    requires_user_confirmation: bool
+    write_decision: Literal["pending", "approved", "rejected", "auto_write"]
+
+
+class MemoryQuery(TypedDict):
+    """Structured memory retrieval query."""
+
+    intent_type: str
+    step_phase: str
+    target_environment: str
+    target_database: Optional[str]
+    target_objects: list[str]
+    risk_level: str
+    allowed_scopes: list[str]
+    max_sensitivity: Literal["public", "internal", "sensitive"]
+
+
 class AgentState(TypedDict):
     """Complete agent state — the single data structure flowing through the graph.
 
@@ -300,6 +357,9 @@ class AgentState(TypedDict):
     context_snapshots: NotRequired[Annotated[list[ContextSnapshot], operator.add]]
     user_constraints: NotRequired[list[str]]
     context_token_budget: NotRequired[int]
+    memory_candidates: NotRequired[Annotated[list[MemoryCandidate], operator.add]]
+    retrieved_memories: NotRequired[list[MemoryRecord]]
+    memory_records_written: NotRequired[Annotated[list[MemoryRecord], operator.add]]
 
     # Human-readable plan summary injected into system prompt.
     plan: Optional[str]

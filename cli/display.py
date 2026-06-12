@@ -202,6 +202,13 @@ def print_loop_status(label: str, payload: dict[str, Any]):
                 f"{str(obs.get('summary', ''))[:100]}"
             )
 
+    written_memories = payload.get("memory_records_written") or []
+    for memory in written_memories:
+        console.print(
+            f"[dim]↳ Memory:[/dim] [cyan]{memory.get('kind')}[/cyan] "
+            f"{str(memory.get('summary', ''))[:100]}"
+        )
+
 
 def print_session_info(session_id: str, model: str, tools_count: int):
     """Display session information."""

@@ -15,7 +15,12 @@ from typing import Any
 from langchain_core.messages import AIMessage, SystemMessage
 
 from agent.config import get_settings
-from agent.context import build_context_snapshot, build_db_working_set, build_prompt_context
+from agent.context import (
+    build_context_snapshot,
+    build_db_working_set,
+    build_prompt_context,
+    retrieve_relevant_memories,
+)
 from agent.llm_factory import create_llm_with_tools
 from agent.state import AgentState
 from memory.manager import MemoryManager
@@ -164,17 +169,20 @@ def llm_reason(state: AgentState) -> dict[str, Any]:
     # by matching ToolMessages. Strip orphaned tool_calls from history.
     messages = _sanitize_tool_call_messages(messages)
 
-    # Prepend system prompt (or update if one already exists)
-    system_content = build_system_prompt(state)
+    step_context = None
+    db_working_set = build_db_working_set(state)
+    retrieved_memories = retrieve_relevant_memories({**state, "db_working_set": db_working_set})
+    enriched_state = {**state, "db_working_set": db_working_set, "retrieved_memories": retrieved_memories}
+    context_snapshot = build_context_snapshot(enriched_state)
+    _, step_context = build_prompt_context(enriched_state)
+
+    # Prepend system prompt after database context and memory retrieval have
+    # been normalized so the LLM sees the same context stored in state.
+    system_content = build_system_prompt(enriched_state)
     if messages and isinstance(messages[0], SystemMessage):
         messages[0] = SystemMessage(content=system_content)
     else:
         messages.insert(0, SystemMessage(content=system_content))
-
-    step_context = None
-    db_working_set = build_db_working_set(state)
-    context_snapshot = build_context_snapshot({**state, "db_working_set": db_working_set})
-    _, step_context = build_prompt_context({**state, "db_working_set": db_working_set})
 
     # Invoke LLM
     try:
@@ -199,6 +207,7 @@ def llm_reason(state: AgentState) -> dict[str, Any]:
         "step_count": state.get("step_count", 0) + 1,
         "step_context": step_context,
         "db_working_set": db_working_set,
+        "retrieved_memories": retrieved_memories,
         "context_snapshots": [context_snapshot],
         "tool_calls_pending": (
             [

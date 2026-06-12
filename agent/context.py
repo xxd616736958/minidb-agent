@@ -17,6 +17,8 @@ from agent.state import (
     StepContextPacket,
     TaskStep,
 )
+from memory.schema import build_memory_query
+from memory.store import get_memory_store
 
 
 DEFAULT_CONTEXT_TOKEN_BUDGET = 6000
@@ -365,6 +367,19 @@ def build_prompt_context(state: AgentState) -> tuple[str, StepContextPacket | No
             )
         )
 
+    query = build_memory_query(state)
+    memories = state.get("retrieved_memories")
+    if memories is None:
+        memories = get_memory_store().search(query, limit=5)
+    if memories:
+        sections.append(
+            "## Retrieved Long-Term Memories\n"
+            + "\n".join(
+                f"- [{item.get('kind')}/{item.get('scope')}] {item.get('summary')}"
+                for item in memories[:5]
+            )
+        )
+
     packet_text = format_step_context_packet(packet)
     if packet_text:
         sections.append(packet_text)
@@ -372,3 +387,7 @@ def build_prompt_context(state: AgentState) -> tuple[str, StepContextPacket | No
     budget = int(state.get("context_token_budget") or DEFAULT_CONTEXT_TOKEN_BUDGET)
     return compact_prompt_context("\n\n".join(sections), budget), packet
 
+
+def retrieve_relevant_memories(state: AgentState, limit: int = 5):
+    """Retrieve gated long-term memories for the current task state."""
+    return get_memory_store().search(build_memory_query(state), limit=limit)

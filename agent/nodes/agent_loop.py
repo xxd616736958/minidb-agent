@@ -10,8 +10,14 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, ToolMessage
 
-from agent.context import build_context_snapshot, build_result_digest, build_step_context_packet
+from agent.context import (
+    build_context_snapshot,
+    build_result_digest,
+    build_step_context_packet,
+    retrieve_relevant_memories,
+)
 from agent.state import AgentState, DBObservation, ResultDigest, TaskStep, VerificationResult
+from memory.consolidator import consolidate_memories
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +187,38 @@ def _policy_violation_message(policy: str, tool_calls: list[dict[str, Any]]) -> 
     return None
 
 
+def _safety_memory_violation(state: AgentState, tool_calls: list[dict[str, Any]]) -> str | None:
+    """Apply retrieved SafetyMemory/prohibition records to concrete tool calls."""
+    write_calls = [call for call in tool_calls if _is_write_call(call)]
+    if not write_calls:
+        return None
+
+    memories = state.get("retrieved_memories")
+    if memories is None:
+        memories = retrieve_relevant_memories(state, limit=8)
+
+    for memory in memories:
+        if memory.get("kind") != "prohibition":
+            continue
+        text = f"{memory.get('summary', '')} {memory.get('payload', {})}".lower()
+        if (
+            "只读" in text
+            or "read-only" in text
+            or "read only" in text
+            or "不要执行" in text
+            or "禁止" in text
+        ):
+            return f"Long-term SafetyMemory prohibits write SQL: {memory.get('summary')}"
+
+        blocked_verbs = ("drop", "truncate", "delete", "update", "insert", "alter", "grant", "revoke")
+        for call in write_calls:
+            call_text = _tool_args_text(call).lower()
+            if any(verb in text and re.search(rf"\b{verb}\b", call_text, re.IGNORECASE) for verb in blocked_verbs):
+                return f"Long-term SafetyMemory blocks this SQL pattern: {memory.get('summary')}"
+
+    return None
+
+
 def _current_step_from_state(state: AgentState) -> TaskStep | None:
     steps = _plan_steps(state)
     step_id = state.get("current_step_id")
@@ -209,6 +247,9 @@ def tool_policy_gate(state: AgentState) -> dict[str, Any]:
     packet = state.get("step_context") or build_step_context_packet(state)
     policy = str((packet or {}).get("tool_policy") or (current_step or {}).get("tool_policy", "no_tools"))
     violation = _policy_violation_message(policy, tool_calls)
+    safety_violation = _safety_memory_violation(state, tool_calls)
+    if safety_violation:
+        violation = safety_violation
 
     if policy == "write_tools_after_approval":
         approved = any(
@@ -216,7 +257,7 @@ def tool_policy_gate(state: AgentState) -> dict[str, Any]:
             and decision.get("status") == "approved"
             for decision in state.get("approval_decisions", [])
         )
-        if not approved and any(_is_write_call(call) for call in tool_calls):
+        if not violation and not approved and any(_is_write_call(call) for call in tool_calls):
             violation = "Current write-capable PostgreSQL step requires explicit approval before execution."
 
     if not violation:
@@ -370,6 +411,7 @@ def verify_step(state: AgentState) -> dict[str, Any]:
         **update,
         "verification_results": [*state.get("verification_results", []), result],
     }
+    memory_updates = consolidate_memories(snapshot_state) if status == "passed" else {}
     update.update(
         {
             "verification_results": [result],
@@ -377,6 +419,7 @@ def verify_step(state: AgentState) -> dict[str, Any]:
             "replan_trigger": "verification_blocked" if status in {"failed", "blocked"} else None,
             "step_context": build_step_context_packet(snapshot_state),
             "context_snapshots": [build_context_snapshot(snapshot_state)],
+            **memory_updates,
         }
     )
     return update

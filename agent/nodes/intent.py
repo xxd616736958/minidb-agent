@@ -12,6 +12,9 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from agent.llm_factory import create_llm_no_tools
 from agent.state import AgentState, ClarificationRequest, DBTaskIntent
+from memory.consolidator import consolidate_explicit_memory_request
+from memory.schema import build_memory_query
+from memory.store import get_memory_store
 
 logger = logging.getLogger(__name__)
 
@@ -329,10 +332,12 @@ def intent_analyzer(state: AgentState) -> dict[str, Any]:
         parsed = {}
 
     intent = normalize_intent(parsed, user_content)
+    explicit_memory_updates = consolidate_explicit_memory_request(state, user_content)
     return {
         "current_intent": intent,
         "intent_history": [intent],
         "selected_workflow": intent.get("suggested_workflow"),
+        **explicit_memory_updates,
     }
 
 
@@ -394,6 +399,22 @@ def _append_missing(intent: DBTaskIntent, slot: str) -> None:
         intent["missing_slots"].append(slot)
 
 
+def _apply_safety_memories(intent: DBTaskIntent, state: AgentState) -> None:
+    """Merge active SafetyMemory records into the current intent constraints."""
+    query_state = {**state, "current_intent": intent}
+    memories = get_memory_store().search(build_memory_query(query_state), limit=8)
+
+    for memory in memories:
+        if memory.get("kind") != "prohibition":
+            continue
+        summary = str(memory.get("summary", "")).strip()
+        if not summary:
+            continue
+        constraint = f"SafetyMemory: {summary}"
+        if constraint not in intent["constraints"]:
+            intent["constraints"].append(constraint)
+
+
 def intent_validator(state: AgentState) -> dict[str, Any]:
     """Validate intent completeness and apply deterministic database safety rules."""
     intent = state.get("current_intent")
@@ -401,6 +422,7 @@ def intent_validator(state: AgentState) -> dict[str, Any]:
         return {}
 
     intent = dict(intent)
+    _apply_safety_memories(intent, state)
     user_content = _latest_user_content(state)
     text = " ".join(
         [

@@ -89,6 +89,11 @@ class AgentSettings(BaseSettings):
         default=12000, alias="MEMORY_COMPACT_THRESHOLD",
         description="Token count threshold to trigger compaction"
     )
+    memory_store_path: str = Field(
+        default="data/memory_records.json",
+        alias="MEMORY_STORE_PATH",
+        description="Path for PostgreSQL agent long-term memory records"
+    )
 
     # ── Shell Tool ─────────────────────────────────────
     command_whitelist: str = Field(

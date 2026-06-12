@@ -19,6 +19,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from agent.config import get_settings
 from agent.llm_factory import create_llm_no_tools
 from agent.state import AgentState, DBTaskPlan, TaskStep
+from memory.schema import build_memory_query
+from memory.store import get_memory_store
 
 logger = logging.getLogger(__name__)
 
@@ -239,6 +241,26 @@ def _build_workflow_context(state: AgentState) -> str:
     for idx, step in enumerate(steps, start=1):
         lines.append(f"{idx}. {step}")
     return "\n".join(lines)
+
+
+def _build_memory_context(state: AgentState) -> str:
+    """Format working memory and gated long-term memories for planning."""
+    parts = []
+    working_memory = state.get("working_memory", {})
+    if working_memory:
+        parts.append(json.dumps(working_memory, ensure_ascii=False, indent=2))
+
+    memories = state.get("retrieved_memories")
+    if memories is None:
+        memories = get_memory_store().search(build_memory_query(state), limit=6)
+    if memories:
+        parts.append("Relevant long-term memories:")
+        for memory in memories[:6]:
+            parts.append(
+                f"- [{memory.get('kind')}/{memory.get('scope')}] {memory.get('summary')}"
+            )
+
+    return "\n".join(parts) if parts else "No relevant memory is available."
 
 
 def _now_iso() -> str:
@@ -700,7 +722,7 @@ def task_planner(state: AgentState) -> dict[str, Any]:
 
         response = llm.invoke([
             SystemMessage(content=TASK_PLANNER_SYSTEM_PROMPT.format(
-                memory_context=state.get("working_memory", {}),
+                memory_context=_build_memory_context(state),
                 intent_context=_build_intent_context(state),
                 workflow_context=_build_workflow_context(state),
             )),
