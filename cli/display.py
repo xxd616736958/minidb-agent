@@ -176,6 +176,33 @@ def print_clarification(request: dict[str, Any]):
     console.print(panel)
 
 
+def print_loop_status(label: str, payload: dict[str, Any]):
+    """Display concise Agent Loop status updates."""
+    if not payload:
+        return
+    if label == "step_scheduler":
+        step_id = payload.get("current_step_id")
+        status = payload.get("loop_status")
+        if step_id:
+            console.print(f"[dim]▶ Step:[/dim] [cyan]{step_id}[/cyan] [dim]({status})[/dim]")
+        elif status:
+            console.print(f"[dim]Loop:[/dim] {status}")
+    elif label == "verify_step":
+        results = payload.get("verification_results") or []
+        for result in results:
+            console.print(
+                f"[dim]✓ Verify:[/dim] [cyan]{result.get('step_id')}[/cyan] "
+                f"[dim]{result.get('status')}[/dim]"
+            )
+    elif label == "normalize_observation":
+        observations = payload.get("db_observations") or []
+        for obs in observations:
+            console.print(
+                f"[dim]◦ Observation:[/dim] [cyan]{obs.get('type')}[/cyan] "
+                f"{str(obs.get('summary', ''))[:100]}"
+            )
+
+
 def print_session_info(session_id: str, model: str, tools_count: int):
     """Display session information."""
     table = Table(show_header=False, box=None, padding=(0, 4))

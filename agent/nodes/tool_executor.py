@@ -82,13 +82,13 @@ def execute_tools(state: AgentState) -> dict[str, Any]:
             content_preview = str(msg.content)[:200]
             tool_results.append(f"[{msg.name}]: {content_preview}")
 
-    # Update task status if executing a plan
+    # Keep task running; verify_step decides completion after observations are
+    # normalized and checked against success criteria.
     task_stack = list(state.get("task_stack", []))
     current_idx = state.get("current_task_index", 0)
     if task_stack and current_idx < len(task_stack):
         task = dict(task_stack[current_idx])
         if not state.get("error"):
-            task["status"] = "completed"
             task["result"] = tool_results[-1] if tool_results else ""
         task_stack[current_idx] = task
 

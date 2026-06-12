@@ -34,6 +34,7 @@ from cli.display import (
     print_error,
     print_goodbye,
     print_intent,
+    print_loop_status,
     print_plan,
     print_session_info,
     print_tool_call,
@@ -253,6 +254,10 @@ class AgentRepl:
                     print_db_plan(db_plan)
                 elif plan:
                     print_plan(plan)
+
+            elif node_name in ("step_scheduler", "normalize_observation", "verify_step"):
+                if isinstance(output, dict):
+                    print_loop_status(node_name, output)
 
             elif node_name == "intent_validator":
                 intent = output.get("current_intent") if isinstance(output, dict) else None

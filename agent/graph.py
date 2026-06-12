@@ -26,9 +26,13 @@ from agent.edges.routes import (
     LLM_REASON,
     EXECUTE_TOOLS,
     HUMAN_APPROVAL,
+    NORMALIZE_OBSERVATION,
     ERROR_HANDLER,
     MEMORY_COMPACTOR,
+    STEP_SCHEDULER,
     TASK_PLANNER,
+    TOOL_POLICY_GATE,
+    VERIFY_STEP,
     route_after_approval,
     route_after_clarification,
     route_after_compactor,
@@ -36,10 +40,20 @@ from agent.edges.routes import (
     route_after_intent_analyzer,
     route_after_intent_validator,
     route_after_llm,
+    route_after_observation,
     route_after_planner,
+    route_after_policy_gate,
+    route_after_scheduler,
     route_after_start,
     route_after_tools,
+    route_after_verify,
     route_after_workflow_planner,
+)
+from agent.nodes.agent_loop import (
+    normalize_observation,
+    step_scheduler,
+    tool_policy_gate,
+    verify_step,
 )
 from agent.nodes.error_handler import error_handler
 from agent.nodes.human_approval import human_approval
@@ -91,10 +105,14 @@ def build_graph() -> StateGraph:
     builder.add_node(CLARIFICATION_GATE, clarification_gate)
     builder.add_node(WORKFLOW_PLANNER, workflow_planner)
     builder.add_node(TASK_PLANNER, task_planner)
+    builder.add_node(STEP_SCHEDULER, step_scheduler)
     builder.add_node(MEMORY_COMPACTOR, memory_compactor)
     builder.add_node(LLM_REASON, llm_reason)
+    builder.add_node(TOOL_POLICY_GATE, tool_policy_gate)
     builder.add_node(HUMAN_APPROVAL, human_approval)
     builder.add_node(EXECUTE_TOOLS, execute_tools)
+    builder.add_node(NORMALIZE_OBSERVATION, normalize_observation)
+    builder.add_node(VERIFY_STEP, verify_step)
     builder.add_node(ERROR_HANDLER, error_handler)
 
     # ── Add edges ────────────────────────────────────────
@@ -152,9 +170,19 @@ def build_graph() -> StateGraph:
         TASK_PLANNER,
         route_after_planner,
         {
+            "step_scheduler": STEP_SCHEDULER,
             "memory_compactor": MEMORY_COMPACTOR,
-            "llm_reason": LLM_REASON,
             "error_handler": ERROR_HANDLER,
+        },
+    )
+
+    builder.add_conditional_edges(
+        STEP_SCHEDULER,
+        route_after_scheduler,
+        {
+            "memory_compactor": MEMORY_COMPACTOR,
+            "error_handler": ERROR_HANDLER,
+            END: END,
         },
     )
 
@@ -173,9 +201,20 @@ def build_graph() -> StateGraph:
         LLM_REASON,
         route_after_llm,
         {
-            "human_approval": HUMAN_APPROVAL,
+            "tool_policy_gate": TOOL_POLICY_GATE,
+            "verify_step": VERIFY_STEP,
             "error_handler": ERROR_HANDLER,
             END: END,
+        },
+    )
+
+    builder.add_conditional_edges(
+        TOOL_POLICY_GATE,
+        route_after_policy_gate,
+        {
+            "human_approval": HUMAN_APPROVAL,
+            "llm_reason": LLM_REASON,
+            "error_handler": ERROR_HANDLER,
         },
     )
 
@@ -196,10 +235,26 @@ def build_graph() -> StateGraph:
         EXECUTE_TOOLS,
         route_after_tools,
         {
+            "normalize_observation": NORMALIZE_OBSERVATION,
             "error_handler": ERROR_HANDLER,
-            "memory_compactor": MEMORY_COMPACTOR,
-            "llm_reason": LLM_REASON,
-            END: END,
+        },
+    )
+
+    builder.add_conditional_edges(
+        NORMALIZE_OBSERVATION,
+        route_after_observation,
+        {
+            "verify_step": VERIFY_STEP,
+            "error_handler": ERROR_HANDLER,
+        },
+    )
+
+    builder.add_conditional_edges(
+        VERIFY_STEP,
+        route_after_verify,
+        {
+            "step_scheduler": STEP_SCHEDULER,
+            "error_handler": ERROR_HANDLER,
         },
     )
 

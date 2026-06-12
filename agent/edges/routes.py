@@ -21,10 +21,14 @@ INTENT_VALIDATOR = "intent_validator"
 CLARIFICATION_GATE = "clarification_gate"
 WORKFLOW_PLANNER = "workflow_planner"
 TASK_PLANNER = "task_planner"
+STEP_SCHEDULER = "step_scheduler"
 MEMORY_COMPACTOR = "memory_compactor"
 LLM_REASON = "llm_reason"
+TOOL_POLICY_GATE = "tool_policy_gate"
 HUMAN_APPROVAL = "human_approval"
 EXECUTE_TOOLS = "execute_tools"
+NORMALIZE_OBSERVATION = "normalize_observation"
+VERIFY_STEP = "verify_step"
 ERROR_HANDLER = "error_handler"
 END = "__end__"
 
@@ -86,9 +90,24 @@ def route_after_workflow_planner(
 
 def route_after_planner(
     state: AgentState,
-) -> Literal["memory_compactor", "llm_reason", "error_handler"]:
+) -> Literal["step_scheduler", "memory_compactor", "error_handler"]:
     """After task planning: check for errors, then determine next step."""
     if state.get("error"):
+        return ERROR_HANDLER
+    if state.get("db_task_plan") or state.get("task_stack"):
+        return STEP_SCHEDULER
+    return MEMORY_COMPACTOR
+
+
+def route_after_scheduler(
+    state: AgentState,
+) -> Literal["memory_compactor", "error_handler", END]:
+    """After step scheduling: continue, handle blocked state, or finish."""
+    if state.get("error"):
+        return ERROR_HANDLER
+    if state.get("loop_status") == "completed":
+        return END
+    if state.get("loop_status") == "blocked":
         return ERROR_HANDLER
     return MEMORY_COMPACTOR
 
@@ -104,12 +123,13 @@ def route_after_compactor(
 
 def route_after_llm(
     state: AgentState,
-) -> Literal["human_approval", "error_handler", END]:
+) -> Literal["tool_policy_gate", "verify_step", "error_handler", END]:
     """After LLM response: route based on content.
 
-    - tool_calls → human_approval (to check for dangerous commands)
+    - tool_calls → tool_policy_gate
     - error → error_handler
-    - no tool_calls, no error → END (final answer)
+    - planned step without tool calls → step_scheduler after verification-free completion
+    - no plan, no tool calls → END
     """
     if state.get("error"):
         logger.debug("LLM produced error → error_handler")
@@ -123,25 +143,27 @@ def route_after_llm(
     last_msg = messages[-1]
     tool_calls = getattr(last_msg, "tool_calls", None)
     if tool_calls:
-        logger.debug(f"LLM produced {len(tool_calls)} tool call(s) → human_approval")
-        return HUMAN_APPROVAL
+        logger.debug(f"LLM produced {len(tool_calls)} tool call(s) → tool_policy_gate")
+        return TOOL_POLICY_GATE
 
-    # Check if we have more tasks in the plan
     task_stack = state.get("task_stack", [])
-    current_idx = state.get("current_task_index", 0)
-    if task_stack and current_idx < len(task_stack):
-        # Check if all tasks are done
-        pending = [t for t in task_stack if t.get("status") not in ("completed", "failed", "skipped")]
-        if pending:
-            # Advance to next pending task
-            next_idx = task_stack.index(pending[0])
-            return LLM_REASON  # Continue execution
-        else:
-            logger.debug("All tasks complete → END")
-            return END
+    if task_stack and state.get("current_step_id"):
+        logger.debug("LLM produced no tools for planned step → verify_step")
+        return VERIFY_STEP
 
     logger.debug("No tool calls, no pending tasks → END (final answer)")
     return END
+
+
+def route_after_policy_gate(
+    state: AgentState,
+) -> Literal["human_approval", "llm_reason", "error_handler"]:
+    """After tool policy gate: approve safe calls or ask LLM to adjust."""
+    if state.get("error"):
+        return ERROR_HANDLER
+    if state.get("policy_violation"):
+        return LLM_REASON
+    return HUMAN_APPROVAL
 
 
 def route_after_approval(
@@ -174,33 +196,29 @@ def route_after_approval(
 
 def route_after_tools(
     state: AgentState,
-) -> Literal["error_handler", "memory_compactor", END]:
+) -> Literal["normalize_observation", "error_handler"]:
     """After tool execution: check results, handle errors, or continue."""
     if state.get("error"):
         return ERROR_HANDLER
+    return NORMALIZE_OBSERVATION
 
-    # Check if we should advance the task
-    task_stack = state.get("task_stack", [])
-    current_idx = state.get("current_task_index", 0)
-    if task_stack and current_idx < len(task_stack):
-        # Mark current task as completed, move to next
-        next_idx = current_idx + 1
-        if next_idx >= len(task_stack):
-            return LLM_REASON  # All tasks done, let LLM summarize
-        # More tasks → check if next task's dependencies are met
-        next_task = task_stack[next_idx]
-        deps = next_task.get("dependencies", [])
-        completed_ids = {
-            t["id"] for t in task_stack
-            if t.get("status") == "completed"
-        }
-        if all(d in completed_ids for d in deps):
-            return MEMORY_COMPACTOR  # Continue with next task
-        else:
-            return LLM_REASON  # Let LLM handle dependency resolution
 
-    # Loop back: compact then LLM again
-    return MEMORY_COMPACTOR
+def route_after_observation(
+    state: AgentState,
+) -> Literal["verify_step", "error_handler"]:
+    """After observation normalization: verify current step."""
+    if state.get("error"):
+        return ERROR_HANDLER
+    return VERIFY_STEP
+
+
+def route_after_verify(
+    state: AgentState,
+) -> Literal["step_scheduler", "error_handler"]:
+    """After step verification: continue or handle blocked state."""
+    if state.get("error") or state.get("loop_status") == "blocked":
+        return ERROR_HANDLER
+    return STEP_SCHEDULER
 
 
 def route_after_error_handler(

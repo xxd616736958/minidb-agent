@@ -9,12 +9,14 @@ from agent.edges.routes import (
     route_after_start,
     route_after_intent_validator,
     route_after_clarification,
+    route_after_policy_gate,
     route_after_tools,
     route_after_error_handler,
     END,
     INTENT_ANALYZER,
     CLARIFICATION_GATE,
     WORKFLOW_PLANNER,
+    TOOL_POLICY_GATE,
     LLM_REASON,
     HUMAN_APPROVAL,
     EXECUTE_TOOLS,
@@ -119,11 +121,11 @@ class TestRouting:
         assert route_after_llm(state) == END
 
     def test_route_after_llm_with_tool_calls(self):
-        """Tool calls → human_approval."""
+        """Tool calls → tool_policy_gate."""
         from langchain_core.messages import AIMessage
         msg = AIMessage(content="", tool_calls=[{"name": "shell_execute", "args": {"command": "ls"}, "id": "1"}])
         state = self._make_state(messages=[msg])
-        assert route_after_llm(state) == HUMAN_APPROVAL
+        assert route_after_llm(state) == TOOL_POLICY_GATE
 
     def test_route_after_llm_with_error(self):
         """Error → error_handler."""
@@ -161,6 +163,14 @@ class TestRouting:
             }
         )
         assert route_after_clarification(state) == END
+
+    def test_route_after_policy_gate_allows_to_approval(self):
+        state = self._make_state(policy_violation=None)
+        assert route_after_policy_gate(state) == HUMAN_APPROVAL
+
+    def test_route_after_policy_gate_violation_returns_to_llm(self):
+        state = self._make_state(policy_violation={"message": "blocked"})
+        assert route_after_policy_gate(state) == LLM_REASON
 
     def test_route_after_planner_no_error(self):
         """No error → memory_compactor."""

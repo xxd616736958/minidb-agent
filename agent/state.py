@@ -143,6 +143,56 @@ class DBTaskPlan(TypedDict):
     updated_at: str
 
 
+class DBObservation(TypedDict):
+    """Structured observation derived from a database/tool result."""
+
+    id: str
+    step_id: str
+    type: Literal[
+        "query_result",
+        "explain_plan",
+        "schema_summary",
+        "index_summary",
+        "row_count_estimate",
+        "lock_wait",
+        "affected_rows",
+        "sql_error",
+        "tool_error",
+    ]
+    source_tool: str
+    summary: str
+    payload: dict[str, Any]
+    created_at: str
+
+
+class ApprovalDecision(TypedDict):
+    """Recorded approval decision for a high-risk task step."""
+
+    id: str
+    step_id: str
+    status: Literal["pending", "approved", "rejected", "edited", "expired"]
+    risk_level: Literal["low", "medium", "high", "critical"]
+    target_environment: str
+    sql_preview: Optional[str]
+    impact_summary: Optional[str]
+    rollback_summary: Optional[str]
+    user_message: Optional[str]
+    created_at: str
+    resolved_at: Optional[str]
+
+
+class VerificationResult(TypedDict):
+    """Result of checking a step's success criteria."""
+
+    id: str
+    step_id: str
+    status: Literal["passed", "failed", "blocked", "skipped"]
+    criteria_checked: list[str]
+    evidence_ids: list[str]
+    summary: str
+    created_at: str
+
+
 class AgentState(TypedDict):
     """Complete agent state — the single data structure flowing through the graph.
 
@@ -169,6 +219,20 @@ class AgentState(TypedDict):
     db_task_plan: NotRequired[Optional[DBTaskPlan]]
     plan_history: NotRequired[Annotated[list[DBTaskPlan], operator.add]]
     replan_trigger: NotRequired[Optional[str]]
+    current_step_id: NotRequired[Optional[str]]
+    loop_status: NotRequired[Literal[
+        "running",
+        "waiting_for_user",
+        "waiting_for_approval",
+        "replanning",
+        "completed",
+        "blocked",
+    ]]
+    db_observations: NotRequired[Annotated[list[DBObservation], operator.add]]
+    approval_decisions: NotRequired[Annotated[list[ApprovalDecision], operator.add]]
+    verification_results: NotRequired[Annotated[list[VerificationResult], operator.add]]
+    pending_approval: NotRequired[Optional[ApprovalDecision]]
+    policy_violation: NotRequired[Optional[dict[str, Any]]]
 
     # Human-readable plan summary injected into system prompt.
     plan: Optional[str]
