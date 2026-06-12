@@ -266,6 +266,88 @@ class ContextSnapshot(TypedDict):
     created_at: str
 
 
+class WorkspaceProfile(TypedDict):
+    """Filesystem workspace boundaries and artifact locations."""
+
+    root_path: str
+    read_allowed_paths: list[str]
+    write_allowed_paths: list[str]
+    artifact_root: str
+    report_root: str
+    temp_root: str
+    default_cwd: str
+    git_repo: Optional[str]
+    dirty_state_known: bool
+
+
+class DatabaseEnvironmentProfile(TypedDict):
+    """Safe, model-visible profile for the current PostgreSQL target."""
+
+    environment_name: Literal["local", "dev", "staging", "production", "unknown"]
+    target_database: Optional[str]
+    safe_host_label: Optional[str]
+    safe_user_label: Optional[str]
+    access_mode: Literal["read_only", "diagnostic", "write_after_approval", "admin_maintenance"]
+    is_production: bool
+    default_statement_timeout_ms: int
+    default_lock_timeout_ms: int
+    max_result_rows: int
+    allow_write_tools: bool
+    require_backup_check_for_writes: bool
+    credential_ref: str
+
+
+class TaskWorkspace(TypedDict):
+    """Per-task workspace for artifacts, reports, logs, and recovery."""
+
+    task_id: str
+    intent_id: Optional[str]
+    plan_id: Optional[str]
+    root_path: str
+    artifact_ids: list[str]
+    report_paths: list[str]
+    sql_draft_paths: list[str]
+    execution_log_ref: Optional[str]
+    created_at: str
+    updated_at: str
+
+
+class ArtifactRecord(TypedDict):
+    """Artifact metadata for task outputs and audit evidence."""
+
+    id: str
+    task_id: str
+    kind: Literal[
+        "sql_draft",
+        "explain_json",
+        "health_report",
+        "query_result_digest",
+        "approval_snapshot",
+        "execution_log",
+        "verification_evidence",
+        "final_report",
+    ]
+    path: Optional[str]
+    payload_ref: Optional[str]
+    summary: str
+    sensitivity: Literal["public", "internal", "sensitive", "secret"]
+    lifecycle: Literal["ephemeral", "session", "persistent"]
+    created_at: str
+
+
+class RuntimePolicy(TypedDict):
+    """Execution-level permissions and resource limits."""
+
+    allow_shell_database_clients: bool
+    allow_network_tools: bool
+    allow_file_writes: bool
+    allow_database_writes: bool
+    require_approval_for_workspace_write: bool
+    require_approval_for_database_write: bool
+    max_tool_duration_seconds: int
+    max_artifact_size_bytes: int
+
+
 class MemoryRecord(TypedDict):
     """Safe, scoped long-term memory record."""
 
@@ -401,6 +483,8 @@ class ToolInvocationRecord(TypedDict):
     duration_ms: Optional[int]
     result_ref: Optional[str]
     observation_ids: list[str]
+    artifact_ids: NotRequired[list[str]]
+    environment_summary: NotRequired[dict[str, Any]]
     error_type: Optional[str]
     error_message: Optional[str]
 
@@ -497,6 +581,11 @@ class AgentState(TypedDict):
     tool_policy_decisions: NotRequired[Annotated[list[ToolCallPolicyDecision], operator.add]]
     tool_invocation_records: NotRequired[Annotated[list[ToolInvocationRecord], operator.add]]
     tool_execution_results: NotRequired[Annotated[list[ToolExecutionResult], operator.add]]
+    workspace_profile: NotRequired[Optional[WorkspaceProfile]]
+    database_environment: NotRequired[Optional[DatabaseEnvironmentProfile]]
+    task_workspace: NotRequired[Optional[TaskWorkspace]]
+    artifact_records: NotRequired[Annotated[list[ArtifactRecord], operator.add]]
+    runtime_policy: NotRequired[Optional[RuntimePolicy]]
 
     # Human-readable plan summary injected into system prompt.
     plan: Optional[str]

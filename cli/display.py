@@ -209,9 +209,18 @@ def print_loop_status(label: str, payload: dict[str, Any]):
                 f"{decision.get('decision')} - {str(decision.get('reason', ''))[:100]}"
             )
     elif label == "llm_reason":
+        _print_execution_environment(payload)
         tools = payload.get("available_tools") or []
         if tools:
             console.print(f"[dim]Available tools:[/dim] {', '.join(str(tool) for tool in tools)}")
+    elif label == "execute_tools":
+        _print_execution_environment(payload)
+        artifacts = payload.get("artifact_records") or []
+        for artifact in artifacts:
+            console.print(
+                f"[dim]↳ Artifact:[/dim] [cyan]{artifact.get('kind')}[/cyan] "
+                f"{str(artifact.get('summary', ''))[:100]}"
+            )
 
     written_memories = payload.get("memory_records_written") or []
     for memory in written_memories:
@@ -219,6 +228,26 @@ def print_loop_status(label: str, payload: dict[str, Any]):
             f"[dim]↳ Memory:[/dim] [cyan]{memory.get('kind')}[/cyan] "
             f"{str(memory.get('summary', ''))[:100]}"
         )
+
+
+def _print_execution_environment(payload: dict[str, Any]) -> None:
+    workspace = payload.get("workspace_profile") or {}
+    db_env = payload.get("database_environment") or {}
+    task_workspace = payload.get("task_workspace") or {}
+    if not workspace and not db_env and not task_workspace:
+        return
+
+    env_name = db_env.get("environment_name") or "unknown"
+    database = db_env.get("target_database") or "unknown-db"
+    host = db_env.get("safe_host_label") or "unknown-host"
+    access = db_env.get("access_mode") or "unknown"
+    task_id = task_workspace.get("task_id") or "no-task"
+    root = workspace.get("root_path") or "unknown-workspace"
+    console.print(
+        "[dim]Execution env:[/dim] "
+        f"[cyan]{env_name}/{database}[/cyan] @ {host} "
+        f"[dim]access={access} task={task_id} workspace={root}[/dim]"
+    )
 
 
 def print_session_info(session_id: str, model: str, tools_count: int):

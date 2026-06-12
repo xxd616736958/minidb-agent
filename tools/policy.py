@@ -17,6 +17,7 @@ from agent.state import (
     ToolCallPolicyDecision,
     ToolInvocationRecord,
 )
+from execution.environment import ExecutionEnvironmentManager
 from tools.catalog import current_step
 from tools.registry import registry
 
@@ -26,6 +27,13 @@ WRITE_SQL_RE = re.compile(
     re.IGNORECASE,
 )
 READ_SQL_RE = re.compile(r"\b(select|explain|show|with)\b", re.IGNORECASE)
+POSTGRES_MUTATING_OPERATION_TYPES = {
+    "data_change",
+    "schema_change",
+    "permission_change",
+    "backup_restore",
+    "maintenance",
+}
 
 
 def now_iso() -> str:
@@ -161,6 +169,24 @@ def evaluate_tool_call(state: AgentState, tool_call: dict[str, Any]) -> ToolCall
     if not spec.get("enabled", True):
         return _decision(tool_call, "deny", f"Tool '{tool_name}' is disabled.", risk)
 
+    db_env = state.get("database_environment") or {}
+    runtime_policy = state.get("runtime_policy") or {}
+    capability = spec["capability"]
+    is_mutating_postgres = (
+        capability["domain"] == "postgresql"
+        and (capability["destructive"] or capability["operation_type"] in POSTGRES_MUTATING_OPERATION_TYPES)
+    )
+    if is_mutating_postgres and (
+        db_env.get("is_production") or runtime_policy.get("allow_database_writes") is False
+    ):
+        env_name = db_env.get("environment_name") or "unknown"
+        return _decision(
+            tool_call,
+            "deny",
+            f"Runtime policy blocks PostgreSQL write-capable tools for target environment '{env_name}'.",
+            risk,
+        )
+
     phase = str((step or {}).get("phase", ""))
     if phase and spec["allowed_phases"] and phase not in spec["allowed_phases"]:
         return _decision(
@@ -234,6 +260,8 @@ def make_invocation_record(
         "duration_ms": None,
         "result_ref": None,
         "observation_ids": [],
+        "artifact_ids": [],
+        "environment_summary": ExecutionEnvironmentManager(state).invocation_environment_summary(),
         "error_type": None,
         "error_message": None,
     }

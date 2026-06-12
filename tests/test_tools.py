@@ -99,52 +99,64 @@ class TestBuiltinTools:
 
     def test_file_read(self):
         """Should read file contents."""
-        # Create temp file
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-            f.write("line 1\nline 2\nline 3\n")
-            tmp_path = f.name
-
-        try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
             from tools.builtin.file_read import FileReadTool
-            tool = FileReadTool()
-            result = tool._run(tmp_path)
-            assert "line 1" in result
-            assert "line 2" in result
-            assert "line 3" in result
-        finally:
-            os.unlink(tmp_path)
+            try:
+                with open("input.txt", "w", encoding="utf-8") as f:
+                    f.write("line 1\nline 2\nline 3\n")
+                tool = FileReadTool()
+                result = tool._run("input.txt")
+                assert "line 1" in result
+                assert "line 2" in result
+                assert "line 3" in result
+            finally:
+                os.chdir(old_cwd)
 
     def test_file_read_with_offset_limit(self):
         """Should support offset and limit."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-            f.write("a\nb\nc\nd\ne\n")
-            tmp_path = f.name
-
-        try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
             from tools.builtin.file_read import FileReadTool
-            tool = FileReadTool()
-            result = tool._run(tmp_path, offset=2, limit=2)
-            assert "line 2" not in result or "b" in result  # depends on line numbering format
-        finally:
-            os.unlink(tmp_path)
+            try:
+                with open("input.txt", "w", encoding="utf-8") as f:
+                    f.write("a\nb\nc\nd\ne\n")
+                tool = FileReadTool()
+                result = tool._run("input.txt", offset=2, limit=2)
+                assert "line 2" not in result or "b" in result  # depends on line numbering format
+            finally:
+                os.chdir(old_cwd)
 
     def test_file_read_nonexistent(self):
         """Should return error for missing file."""
-        from tools.builtin.file_read import FileReadTool
-        tool = FileReadTool()
-        result = tool._run("/nonexistent/file/path.txt")
-        assert "not found" in result.lower()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            from tools.builtin.file_read import FileReadTool
+            try:
+                tool = FileReadTool()
+                result = tool._run("missing.txt")
+                assert "not found" in result.lower()
+            finally:
+                os.chdir(old_cwd)
 
     def test_file_write(self):
         """Should create a file."""
         with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
             from tools.builtin.file_write import FileWriteTool
-            tool = FileWriteTool()
-            test_path = os.path.join(tmpdir, "test_output.txt")
-            result = tool._run(test_path, "Hello, World!")
-            assert "Created file" in result or "Updated file" in result
-            with open(test_path) as f:
-                assert f.read() == "Hello, World!"
+            try:
+                tool = FileWriteTool()
+                test_path = "test_output.txt"
+                result = tool._run(test_path, "Hello, World!")
+                assert "Created file" in result or "Updated file" in result
+                with open(test_path) as f:
+                    assert f.read() == "Hello, World!"
+            finally:
+                os.chdir(old_cwd)
 
     def test_code_search(self):
         """Should search for patterns in files."""

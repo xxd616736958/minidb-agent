@@ -367,6 +367,35 @@ def build_prompt_context(state: AgentState) -> tuple[str, StepContextPacket | No
             )
         )
 
+    workspace = state.get("workspace_profile")
+    db_env = state.get("database_environment")
+    runtime_policy = state.get("runtime_policy")
+    task_workspace = state.get("task_workspace")
+    if workspace or db_env or runtime_policy or task_workspace:
+        sections.append(
+            "## Execution Environment\n"
+            + json.dumps(
+                {
+                    "workspace_root": (workspace or {}).get("root_path"),
+                    "artifact_root": (workspace or {}).get("artifact_root"),
+                    "task_workspace": (task_workspace or {}).get("root_path"),
+                    "database_environment": {
+                        "environment_name": (db_env or {}).get("environment_name"),
+                        "target_database": (db_env or {}).get("target_database"),
+                        "safe_host_label": (db_env or {}).get("safe_host_label"),
+                        "access_mode": (db_env or {}).get("access_mode"),
+                        "is_production": (db_env or {}).get("is_production"),
+                    },
+                    "runtime_policy": {
+                        "allow_shell_database_clients": (runtime_policy or {}).get("allow_shell_database_clients"),
+                        "allow_database_writes": (runtime_policy or {}).get("allow_database_writes"),
+                    },
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+
     query = build_memory_query(state)
     memories = state.get("retrieved_memories")
     if memories is None:

@@ -16,6 +16,13 @@ RISK_ORDER = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 WRITE_TOOL_HINT_RE = re.compile(r"(write|execute|shell|delete|drop|alter|grant|revoke)", re.IGNORECASE)
 POSTGRES_READ_ALIASES = {"postgres_read", "postgres_readonly", "postgres_query", "postgres_observe"}
 POSTGRES_WRITE_ALIASES = {"postgres_write", "postgres_execute", "postgres_execute_write"}
+POSTGRES_MUTATING_OPERATION_TYPES = {
+    "data_change",
+    "schema_change",
+    "permission_change",
+    "backup_restore",
+    "maintenance",
+}
 
 
 def _schema_dict(tool: BaseTool) -> dict[str, Any]:
@@ -186,8 +193,18 @@ def spec_allowed_for_state(spec: RegisteredToolSpec, state: AgentState) -> bool:
     expected_tools = set(step.get("expected_tools", []) or [])
     capability = spec["capability"]
     name = spec["name"]
+    db_env = state.get("database_environment") or {}
+    runtime_policy = state.get("runtime_policy") or {}
 
     if policy == "no_tools":
+        return False
+    is_mutating_postgres_tool = (
+        capability["domain"] == "postgresql"
+        and (capability["destructive"] or capability["operation_type"] in POSTGRES_MUTATING_OPERATION_TYPES)
+    )
+    if is_mutating_postgres_tool and (
+        db_env.get("is_production") or runtime_policy.get("allow_database_writes") is False
+    ):
         return False
     if phase and spec["allowed_phases"] and phase not in spec["allowed_phases"]:
         return False

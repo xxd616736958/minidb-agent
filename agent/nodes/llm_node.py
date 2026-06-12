@@ -25,6 +25,7 @@ from agent.llm_factory import create_llm_with_tools
 from agent.state import AgentState
 from memory.manager import MemoryManager
 from memory.working import WORKING_MEMORY_SYSTEM_PROMPT
+from execution.environment import ExecutionEnvironmentManager
 from tools.registry import registry
 
 logger = logging.getLogger(__name__)
@@ -155,9 +156,11 @@ def llm_reason(state: AgentState) -> dict[str, Any]:
     messages = _sanitize_tool_call_messages(messages)
 
     step_context = None
-    db_working_set = build_db_working_set(state)
-    retrieved_memories = retrieve_relevant_memories({**state, "db_working_set": db_working_set})
-    enriched_state = {**state, "db_working_set": db_working_set, "retrieved_memories": retrieved_memories}
+    environment_update = ExecutionEnvironmentManager(state).bootstrap_state()
+    state_with_environment = {**state, **environment_update}
+    db_working_set = build_db_working_set(state_with_environment)
+    retrieved_memories = retrieve_relevant_memories({**state_with_environment, "db_working_set": db_working_set})
+    enriched_state = {**state_with_environment, "db_working_set": db_working_set, "retrieved_memories": retrieved_memories}
     visible_tools, visible_specs = registry.get_for_state(enriched_state)
     try:
         llm = create_llm_with_tools(visible_tools)
@@ -202,6 +205,7 @@ def llm_reason(state: AgentState) -> dict[str, Any]:
         "step_context": step_context,
         "db_working_set": db_working_set,
         "retrieved_memories": retrieved_memories,
+        **environment_update,
         "available_tools": [tool.name for tool in visible_tools],
         "available_tool_specs": visible_specs,
         "context_snapshots": [context_snapshot],

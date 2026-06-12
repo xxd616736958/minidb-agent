@@ -10,12 +10,14 @@ This node uses the official langgraph.prebuilt.ToolNode which handles:
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 from datetime import datetime, timezone
 
 from langchain_core.messages import ToolMessage
 
 from agent.state import AgentState
+from execution.environment import ArtifactStore, ExecutionEnvironmentManager
 from tools.postgres.results import loads_result
 from tools.registry import registry
 
@@ -59,19 +61,26 @@ def _result_type(tool_name: str, content: str) -> str:
     return "query_result"
 
 
-def _tool_execution_result(msg: ToolMessage, started_at: datetime) -> dict[str, Any]:
+def _tool_execution_result(
+    msg: ToolMessage,
+    started_at: datetime,
+    environment_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     content = str(getattr(msg, "content", ""))
     name = str(getattr(msg, "name", "tool"))
     duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
     structured = loads_result(content)
     if structured:
+        payload = dict(structured.get("payload", {}))
+        if environment_summary:
+            payload["execution_environment"] = environment_summary
         return {
             "tool_call_id": str(getattr(msg, "tool_call_id", "")),
             "tool_name": structured.get("tool_name") or name,
             "success": structured.get("success", False),
             "result_type": structured.get("result_type", "tool_error"),
             "summary": structured.get("summary", "")[:300],
-            "payload": structured.get("payload", {}),
+            "payload": payload,
             "row_count": structured.get("row_count"),
             "affected_rows": structured.get("affected_rows"),
             "sqlstate": structured.get("sqlstate"),
@@ -87,7 +96,7 @@ def _tool_execution_result(msg: ToolMessage, started_at: datetime) -> dict[str, 
         "success": success,
         "result_type": result_type,
         "summary": content[:300],
-        "payload": {"content": content},
+        "payload": {"content": content, **({"execution_environment": environment_summary} if environment_summary else {})},
         "row_count": None,
         "affected_rows": None,
         "sqlstate": None,
@@ -97,10 +106,50 @@ def _tool_execution_result(msg: ToolMessage, started_at: datetime) -> dict[str, 
     }
 
 
-def _update_invocation_records(state: AgentState, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _artifact_kind_for_result(result: dict[str, Any]) -> str:
+    result_type = str(result.get("result_type") or "")
+    tool_name = str(result.get("tool_name") or "")
+    summary = str(result.get("summary") or "")
+    if tool_name == "file_write":
+        lowered = summary.lower()
+        if ".sql" in lowered:
+            return "sql_draft"
+        if ".md" in lowered or "report" in lowered:
+            return "final_report"
+        return "execution_log"
+    if result_type == "explain_plan":
+        return "explain_json"
+    if result_type == "health_report":
+        return "health_report"
+    if result_type == "dry_run_report":
+        return "approval_snapshot"
+    if result_type in {"query_result", "schema_summary", "object_detail", "top_queries", "lock_report", "index_advice"}:
+        return "query_result_digest"
+    if result_type in {"write_result", "maintenance_result", "policy_denied", "sql_error", "tool_error"}:
+        return "execution_log"
+    return "execution_log"
+
+
+def _artifact_path_for_result(result: dict[str, Any]) -> str | None:
+    if str(result.get("tool_name") or "") != "file_write":
+        return None
+    match = re.search(r"file:\s+(.+?)\s+\(", str(result.get("summary") or ""))
+    return match.group(1) if match else None
+
+
+def _update_invocation_records(
+    state: AgentState,
+    results: list[dict[str, Any]],
+    artifacts: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     if not results:
         return []
     by_call_id = {result["tool_call_id"]: result for result in results}
+    artifact_ids_by_call_id: dict[str, list[str]] = {}
+    for artifact in artifacts or []:
+        call_id = artifact.get("payload_ref")
+        if call_id:
+            artifact_ids_by_call_id.setdefault(str(call_id), []).append(str(artifact.get("id")))
     updated = []
     now = datetime.now(timezone.utc).isoformat()
     for record in state.get("tool_invocation_records", []):
@@ -113,6 +162,10 @@ def _update_invocation_records(state: AgentState, results: list[dict[str, Any]])
         record["status"] = "succeeded" if result.get("success") else "failed"
         record["duration_ms"] = result.get("duration_ms")
         record["result_ref"] = call_id
+        record["artifact_ids"] = artifact_ids_by_call_id.get(str(call_id), [])
+        environment_summary = result.get("payload", {}).get("execution_environment")
+        if environment_summary:
+            record["environment_summary"] = environment_summary
         if not result.get("success"):
             record["error_type"] = result.get("result_type")
             record["error_message"] = result.get("summary")
@@ -148,6 +201,10 @@ def execute_tools(state: AgentState) -> dict[str, Any]:
         f"{[tc['name'] for tc in tool_calls]}"
     )
 
+    env_manager = ExecutionEnvironmentManager(state)
+    environment_update = env_manager.bootstrap_state()
+    environment_summary = env_manager.invocation_environment_summary()
+
     # Execute via LangGraph's ToolNode
     started_at = datetime.now(timezone.utc)
     try:
@@ -169,7 +226,28 @@ def execute_tools(state: AgentState) -> dict[str, Any]:
             content_preview = str(msg.content)[:200]
             tool_results.append(f"[{msg.name}]: {content_preview}")
         if isinstance(msg, ToolMessage):
-            structured_results.append(_tool_execution_result(msg, started_at))
+            structured_results.append(_tool_execution_result(msg, started_at, environment_summary))
+
+    artifact_records = [
+        ArtifactStore(environment_update.get("task_workspace")).record(
+            kind=_artifact_kind_for_result(result),
+            path=_artifact_path_for_result(result),
+            summary=f"{result.get('tool_name')} -> {result.get('result_type')} ({'ok' if result.get('success') else 'failed'})",
+            payload_ref=result.get("tool_call_id"),
+            sensitivity="internal",
+            lifecycle="persistent",
+        )
+        for result in structured_results
+    ]
+    if artifact_records and environment_update.get("task_workspace"):
+        task_workspace = dict(environment_update["task_workspace"])
+        existing_artifact_ids = list(task_workspace.get("artifact_ids", []))
+        task_workspace["artifact_ids"] = [
+            *existing_artifact_ids,
+            *(artifact["id"] for artifact in artifact_records),
+        ]
+        task_workspace["updated_at"] = datetime.now(timezone.utc).isoformat()
+        environment_update["task_workspace"] = task_workspace
 
     # Keep task running; verify_step decides completion after observations are
     # normalized and checked against success criteria.
@@ -195,7 +273,9 @@ def execute_tools(state: AgentState) -> dict[str, Any]:
         "messages": new_messages,
         "tool_call_results": tool_results,
         "tool_execution_results": structured_results,
-        "tool_invocation_records": _update_invocation_records(state, structured_results),
+        "tool_invocation_records": _update_invocation_records(state, structured_results, artifact_records),
+        "artifact_records": artifact_records,
+        **environment_update,
         "task_stack": task_stack,
         "db_task_plan": db_task_plan,
         "step_count": state.get("step_count", 0) + 1,

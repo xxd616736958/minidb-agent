@@ -276,6 +276,8 @@ class AgentRepl:
                 self._process_messages(output.get("messages", []))
 
             elif node_name == "execute_tools":
+                if isinstance(output, dict):
+                    print_loop_status(node_name, output)
                 self._process_messages(output.get("messages", []), is_tool=True)
 
             elif node_name == "memory_compactor" and output is not None:

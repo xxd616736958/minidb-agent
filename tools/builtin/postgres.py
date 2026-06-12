@@ -8,6 +8,7 @@ from typing import Any, Literal, Optional, Type
 
 from pydantic import BaseModel, Field
 
+from execution.environment import build_database_environment_profile
 from tools.base import AgentTool
 from tools.postgres.driver import PostgresDriver
 from tools.postgres.results import dumps_result, make_result
@@ -17,6 +18,16 @@ from tools.postgres.sql_safety import classify_sql
 
 def _driver() -> PostgresDriver:
     return PostgresDriver()
+
+
+def _write_blocked_by_environment() -> str | None:
+    profile = build_database_environment_profile()
+    if not profile.get("allow_write_tools"):
+        return (
+            "PostgreSQL write-capable tools are disabled for "
+            f"target environment '{profile.get('environment_name')}'."
+        )
+    return None
 
 
 def _error_result(tool_name: str, result_type: str, error: Exception, duration_ms: int = 0) -> str:
@@ -1036,6 +1047,18 @@ class PostgresExecuteWriteTool(AgentTool):
         rollback_summary: str = "",
     ) -> str:
         started = time.monotonic()
+        blocked = _write_blocked_by_environment()
+        if blocked:
+            return dumps_result(
+                make_result(
+                    tool_name=self.name,
+                    success=False,
+                    result_type="policy_denied",
+                    summary=blocked,
+                    payload={"target_environment": target_environment},
+                    duration_ms=_timed_ms(started),
+                )
+            )
         classification = classify_sql(sql, allow_explain_analyze=True)
         if classification.normalized_sql_hash != approved_sql_hash:
             return dumps_result(
@@ -1165,6 +1188,18 @@ class PostgresCreateIndexConcurrentlyTool(AgentTool):
 
 def _maintenance_result(tool_name: str, sql: str) -> str:
     started = time.monotonic()
+    blocked = _write_blocked_by_environment()
+    if blocked:
+        return dumps_result(
+            make_result(
+                tool_name=tool_name,
+                success=False,
+                result_type="policy_denied",
+                summary=blocked,
+                payload={},
+                duration_ms=_timed_ms(started),
+            )
+        )
     classification = classify_sql(sql, allow_explain_analyze=True)
     try:
         result = _driver().execute(sql, readonly=False, max_rows=20, statement_timeout_ms=120_000)

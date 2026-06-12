@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from agent.config import get_settings
+from execution.environment import build_database_environment_profile
 from tools.postgres.sanitizer import limit_rows, obfuscate_password
 
 
@@ -27,6 +28,7 @@ class PostgresConnectionManager:
 
     def __init__(self, database_url: str | None = None) -> None:
         self.database_url = database_url or os.environ.get("POSTGRES_TARGET_URL") or get_settings().postgres_uri
+        self.profile = build_database_environment_profile(self.database_url)
 
     def check_configured(self) -> None:
         if not self.database_url:
@@ -50,11 +52,14 @@ class PostgresDriver:
         params: list[Any] | tuple[Any, ...] | None = None,
         readonly: bool = False,
         max_rows: int = 100,
-        statement_timeout_ms: int = 30_000,
-        lock_timeout_ms: int = 5_000,
+        statement_timeout_ms: int | None = None,
+        lock_timeout_ms: int | None = None,
     ) -> QueryResult:
         """Execute SQL and return masked, limited rows."""
         self.manager.check_configured()
+        max_rows = min(max_rows, int(self.manager.profile.get("max_result_rows", max_rows) or max_rows))
+        statement_timeout_ms = statement_timeout_ms or int(self.manager.profile.get("default_statement_timeout_ms", 30_000))
+        lock_timeout_ms = lock_timeout_ms or int(self.manager.profile.get("default_lock_timeout_ms", 5_000))
         try:
             import psycopg
             from psycopg.rows import dict_row

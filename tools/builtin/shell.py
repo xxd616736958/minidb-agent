@@ -19,6 +19,7 @@ from typing import Optional, Type
 
 from pydantic import BaseModel, Field
 
+from execution.environment import ExecutionEnvironmentManager
 from tools.base import (
     AgentTool,
     CommandNotAllowedError,
@@ -127,6 +128,10 @@ class ShellTool(AgentTool):
             return "Error: empty command"
 
         base_cmd = cmd_parts[0]
+        env = ExecutionEnvironmentManager()
+        allowed, reason = env.shell_command_allowed(command)
+        if not allowed:
+            return f"COMMAND_BLOCKED: {reason}"
 
         # ── Stage 1: Check dangerous commands first ──────────
         if base_cmd in self._dangerous:
@@ -148,7 +153,12 @@ class ShellTool(AgentTool):
             raise CommandNotAllowedError(command, msg)
 
         # ── Stage 3: Execute ─────────────────────────────────
-        work_dir = cwd or os.getcwd()
+        try:
+            work_dir = str(env.resolve_read_path(cwd)) if cwd else env.workspace_profile["default_cwd"]
+        except PermissionError as e:
+            return f"Error: {e}"
+        max_timeout = float(env.runtime_policy.get("max_tool_duration_seconds", 120))
+        effective_timeout = min(timeout, max_timeout, 120.0)
         logger.info(f"Executing shell command: {command} (cwd={work_dir})")
 
         try:
@@ -158,12 +168,12 @@ class ShellTool(AgentTool):
                 cwd=work_dir,
                 capture_output=True,
                 text=True,
-                timeout=min(timeout, 120.0),
+                timeout=effective_timeout,
             )
         except subprocess.TimeoutExpired:
-            logger.error(f"Command timed out after {timeout}s: {command}")
+            logger.error(f"Command timed out after {effective_timeout}s: {command}")
             return (
-                f"TIMEOUT: Command exceeded {timeout}s limit and was terminated.\n"
+                f"TIMEOUT: Command exceeded {effective_timeout}s limit and was terminated.\n"
                 f"Command: {command}"
             )
 

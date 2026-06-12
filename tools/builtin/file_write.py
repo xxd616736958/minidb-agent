@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
-from typing import Optional, Type
+from typing import Type
 
 from pydantic import BaseModel, Field
 
+from execution.environment import ExecutionEnvironmentManager
 from tools.base import AgentTool
 
 
@@ -48,7 +48,13 @@ class FileWriteTool(AgentTool):
     search_hint: str | None = "write local file content"
 
     def _run(self, path: str, content: str) -> str:
-        file_path = Path(path).expanduser().resolve()
+        try:
+            env = ExecutionEnvironmentManager()
+            if not env.runtime_policy.get("allow_file_writes", True):
+                return "Error: File writes are disabled by the current runtime policy."
+            file_path = env.resolve_write_path(path)
+        except PermissionError as e:
+            return f"Error: {e}"
 
         # Safety: check for existing
         existed = file_path.exists()

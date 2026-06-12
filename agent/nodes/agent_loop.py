@@ -16,6 +16,7 @@ from agent.context import (
     retrieve_relevant_memories,
 )
 from agent.state import AgentState, DBObservation, ResultDigest, TaskStep, VerificationResult
+from execution.environment import ArtifactStore, ExecutionEnvironmentManager
 from memory.consolidator import consolidate_memories
 from tools.policy import evaluate_tool_calls, make_invocation_record, tool_call_items
 
@@ -153,16 +154,18 @@ def tool_policy_gate(state: AgentState) -> dict[str, Any]:
     if not tool_calls:
         return {}
 
-    current_step = _current_step_from_state(state)
-    packet = state.get("step_context")
+    environment_update = ExecutionEnvironmentManager(state).bootstrap_state()
+    policy_state = {**state, **environment_update}
+    current_step = _current_step_from_state(policy_state)
+    packet = policy_state.get("step_context")
     if current_step and packet and packet.get("step_id") != current_step.get("id"):
         packet = None
-    packet = packet or build_step_context_packet(state)
-    decisions = evaluate_tool_calls(state, tool_calls)
+    packet = packet or build_step_context_packet(policy_state)
+    decisions = evaluate_tool_calls(policy_state, tool_calls)
     blocked = [decision for decision in decisions if decision["decision"] in {"deny", "require_approval", "require_clarification"}]
     records = [
         make_invocation_record(
-            state,
+            policy_state,
             call,
             decision,
             status="denied" if decision["decision"] in {"deny", "require_clarification"} else "pending",
@@ -176,6 +179,7 @@ def tool_policy_gate(state: AgentState) -> dict[str, Any]:
             "tool_policy_decisions": decisions,
             "tool_invocation_records": records,
             "step_context": packet,
+            **environment_update,
         }
 
     violation = blocked[0]["reason"]
@@ -205,6 +209,7 @@ def tool_policy_gate(state: AgentState) -> dict[str, Any]:
         "tool_policy_decisions": decisions,
         "tool_invocation_records": records,
         "step_context": packet,
+        **environment_update,
         "loop_status": "blocked" if policy == "write_tools_after_approval" else "running",
     }
 
@@ -346,6 +351,23 @@ def verify_step(state: AgentState) -> dict[str, Any]:
         "created_at": _now_iso(),
     }
 
+    environment_update = ExecutionEnvironmentManager(state).bootstrap_state()
+    verification_artifact = ArtifactStore(environment_update.get("task_workspace")).record(
+        kind="verification_evidence",
+        summary=summary,
+        payload_ref=result["id"],
+        sensitivity="internal",
+        lifecycle="persistent",
+    )
+    if environment_update.get("task_workspace"):
+        task_workspace = dict(environment_update["task_workspace"])
+        task_workspace["artifact_ids"] = [
+            *list(task_workspace.get("artifact_ids", [])),
+            verification_artifact["id"],
+        ]
+        task_workspace["updated_at"] = _now_iso()
+        environment_update["task_workspace"] = task_workspace
+
     update = _sync_plan_and_stack(
         state,
         steps,
@@ -355,7 +377,9 @@ def verify_step(state: AgentState) -> dict[str, Any]:
     snapshot_state = {
         **state,
         **update,
+        **environment_update,
         "verification_results": [*state.get("verification_results", []), result],
+        "artifact_records": [*state.get("artifact_records", []), verification_artifact],
     }
     memory_updates = consolidate_memories(snapshot_state) if status == "passed" else {}
     update.update(
@@ -365,6 +389,8 @@ def verify_step(state: AgentState) -> dict[str, Any]:
             "replan_trigger": "verification_blocked" if status in {"failed", "blocked"} else None,
             "step_context": build_step_context_packet(snapshot_state),
             "context_snapshots": [build_context_snapshot(snapshot_state)],
+            "artifact_records": [verification_artifact],
+            **environment_update,
             **memory_updates,
         }
     )

@@ -30,6 +30,9 @@ env/
 .langgraph_api/
 .langgraph/
 
+# mini-agent runtime workspace
+.mini_agent/
+
 # Data
 data/
 *.sqlite

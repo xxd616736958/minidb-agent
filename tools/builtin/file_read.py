@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Optional, Type
 
 from pydantic import BaseModel, Field
 
+from execution.environment import ExecutionEnvironmentManager
 from tools.base import AgentTool
 
 
@@ -59,7 +59,10 @@ class FileReadTool(AgentTool):
         offset: Optional[int] = None,
         limit: Optional[int] = None,
     ) -> str:
-        file_path = Path(path).expanduser().resolve()
+        try:
+            file_path = ExecutionEnvironmentManager().resolve_read_path(path)
+        except PermissionError as e:
+            return f"Error: {e}"
 
         if not file_path.exists():
             return f"Error: File not found: {path}"
