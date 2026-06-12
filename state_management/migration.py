@@ -49,6 +49,14 @@ class StateMigration:
             "evaluation_results": [],
             "replay_cases": [],
             "quality_reports": [],
+            "agent_roles": [],
+            "delegation_policy_decisions": [],
+            "delegated_tasks": [],
+            "delegation_records": [],
+            "delegation_results": [],
+            "delegation_failures": [],
+            "delegation_evaluations": [],
+            "agent_team_runs": [],
         }
         for key, value in defaults.items():
             if key not in state:

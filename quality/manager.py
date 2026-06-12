@@ -11,6 +11,9 @@ from typing import Any
 
 from agent.state import (
     AgentState,
+    DelegatedTask,
+    DelegationEvaluation,
+    DelegationResult,
     EvaluationCase,
     EvaluationResult,
     QualityGate,
@@ -264,6 +267,73 @@ class QualityManager:
             blocking=bool(errors and not decisions),
         )
 
+    def delegation_result_gate(
+        self,
+        result: DelegationResult,
+        evaluation: DelegationEvaluation | None = None,
+        task: DelegatedTask | None = None,
+    ) -> QualityGate:
+        """Block unsafe or unsupported delegated subagent results."""
+        task = task or next(
+            (item for item in self.state.get("delegated_tasks", []) if item.get("id") == result.get("delegated_task_id")),
+            None,
+        )
+        evaluation = evaluation or next(
+            (item for item in self.state.get("delegation_evaluations", []) if item.get("result_id") == result.get("id")),
+            None,
+        )
+        required = [
+            "delegated_task_known",
+            "result_schema_complete",
+            "evidence_available",
+            "read_only_sql_only",
+            "conclusion_supported",
+            "review_status_resolved",
+        ]
+        passed: list[str] = []
+        failed: list[str] = []
+        if task:
+            passed.append("delegated_task_known")
+        else:
+            failed.append("delegated_task_known")
+        if result.get("summary") and isinstance(result.get("findings"), list):
+            passed.append("result_schema_complete")
+        else:
+            failed.append("result_schema_complete")
+        if result.get("evidence_refs") or not (task or {}).get("required_evidence"):
+            passed.append("evidence_available")
+        else:
+            failed.append("evidence_available")
+        unsafe_sql = [
+            sql for sql in result.get("sql_used", [])
+            if re.search(r"\b(insert|update|delete|drop|alter|grant|revoke|truncate|vacuum|reindex)\b", str(sql), re.IGNORECASE)
+        ]
+        if unsafe_sql:
+            failed.append("read_only_sql_only")
+        else:
+            passed.append("read_only_sql_only")
+        if evaluation:
+            if evaluation.get("conclusion_supported"):
+                passed.append("conclusion_supported")
+            else:
+                failed.append("conclusion_supported")
+            if evaluation.get("status") == "passed":
+                passed.append("review_status_resolved")
+            elif evaluation.get("status") == "needs_review" and result.get("requires_human_review"):
+                failed.append("review_status_resolved")
+            else:
+                failed.append("review_status_resolved")
+        else:
+            failed.extend(["conclusion_supported", "review_status_resolved"])
+        return self.gate(
+            gate_type="delegation_result",
+            target_ref=str(result.get("id") or result.get("delegated_task_id") or "delegation-result"),
+            required_checks=required,
+            passed_checks=list(dict.fromkeys(passed)),
+            failed_checks=list(dict.fromkeys(failed)),
+            blocking=bool(failed),
+        )
+
     def run_evaluation_case(self, case: EvaluationCase, state: AgentState | None = None) -> EvaluationResult:
         state = state or self.state
         failed: list[str] = []
@@ -387,6 +457,8 @@ class QualityManager:
             uncovered_risks.append("safety_regression_not_run")
         if not evaluation_results:
             uncovered_risks.append("evaluation_cases_not_run")
+        if self.state.get("delegated_tasks") and not self.state.get("delegation_evaluations"):
+            uncovered_risks.append("delegation_results_not_evaluated")
         return {
             "id": _new_id("quality-report"),
             "target_ref": target_ref,

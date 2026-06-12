@@ -294,6 +294,7 @@ def print_loop_status(label: str, payload: dict[str, Any]):
         )
 
     _print_error_recovery(payload)
+    _print_delegation(payload)
     _print_quality(payload)
     _print_collaboration_events(payload)
 
@@ -484,6 +485,54 @@ def _print_quality(payload: dict[str, Any]) -> None:
             f"[cyan]{latest_report.get('scope')}[/cyan] "
             f"{latest_report.get('status')} "
             f"review={latest_report.get('human_review_required')}"
+        )
+
+
+def _print_delegation(payload: dict[str, Any]) -> None:
+    decisions = payload.get("delegation_policy_decisions") or []
+    tasks = payload.get("delegated_tasks") or []
+    results = payload.get("delegation_results") or []
+    evaluations = payload.get("delegation_evaluations") or []
+    team_runs = payload.get("agent_team_runs") or []
+    if decisions:
+        latest = decisions[-1]
+        console.print(
+            "[dim]Delegation:[/dim] "
+            f"[cyan]{latest.get('decision')}[/cyan] "
+            f"roles={', '.join(str(role) for role in latest.get('selected_roles', [])[:4]) or 'none'} "
+            f"[dim]{str(latest.get('reason', ''))[:100]}[/dim]"
+        )
+    if tasks:
+        latest_task = tasks[-1]
+        console.print(
+            "[dim]Delegated task:[/dim] "
+            f"[cyan]{latest_task.get('agent_role')}[/cyan] "
+            f"{latest_task.get('status')} step={latest_task.get('parent_step_id')} "
+            f"risk={latest_task.get('risk_level')}"
+        )
+    if results:
+        latest_result = results[-1]
+        console.print(
+            "[dim]Delegation result:[/dim] "
+            f"[cyan]{latest_result.get('status')}[/cyan] "
+            f"review={latest_result.get('requires_human_review')} "
+            f"{str(latest_result.get('summary', ''))[:100]}"
+        )
+    if evaluations:
+        latest_eval = evaluations[-1]
+        failed = latest_eval.get("failed_checks") or []
+        console.print(
+            "[dim]Delegation eval:[/dim] "
+            f"[cyan]{latest_eval.get('status')}[/cyan] "
+            f"failed={str(failed[:2])[:80]}"
+        )
+    if team_runs:
+        latest_team = team_runs[-1]
+        console.print(
+            "[dim]Agent team:[/dim] "
+            f"[cyan]{latest_team.get('status')}[/cyan] "
+            f"tasks={len(latest_team.get('delegated_task_ids') or [])} "
+            f"limit={latest_team.get('concurrency_limit')}"
         )
 
 

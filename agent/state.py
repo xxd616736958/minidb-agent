@@ -464,6 +464,7 @@ class QualityGate(TypedDict):
         "report_quality",
         "ci",
         "human_review",
+        "delegation_result",
     ]
     target_ref: str
     required_checks: list[str]
@@ -540,6 +541,138 @@ class QualityReport(TypedDict):
     human_review_required: bool
     recommendations: list[str]
     created_at: str
+
+
+class AgentRoleDefinition(TypedDict):
+    """Role definition for one controlled PostgreSQL subagent."""
+
+    id: str
+    name: str
+    description: str
+    responsibilities: list[str]
+    allowed_tools: list[str]
+    disallowed_tools: list[str]
+    allowed_phases: list[str]
+    default_model: Optional[str]
+    max_turns: int
+    max_tool_calls: int
+    permission_mode: Literal["read_only", "proposal_only", "review_only"]
+    memory_scope: Literal["none", "task", "project"]
+    can_run_in_parallel: bool
+    output_schema: str
+
+
+class DelegationPolicyDecision(TypedDict):
+    """Decision on whether a task step should be delegated to a subagent."""
+
+    id: str
+    step_id: str
+    decision: Literal["do_not_delegate", "delegate", "parallel_delegate", "review_required"]
+    selected_roles: list[str]
+    reason: str
+    constraints: list[str]
+    blocked_reasons: list[str]
+    created_at: str
+
+
+class DelegatedTask(TypedDict):
+    """Structured delegation order from the coordinator to one subagent."""
+
+    id: str
+    parent_task_id: str
+    parent_step_id: str
+    agent_role: str
+    objective: str
+    scope: dict[str, Any]
+    context_packet: dict[str, Any]
+    allowed_tools: list[str]
+    forbidden_actions: list[str]
+    expected_output: str
+    success_criteria: list[str]
+    required_evidence: list[str]
+    risk_level: Literal["low", "medium", "high", "critical"]
+    max_turns: int
+    max_tool_calls: int
+    status: Literal["pending", "running", "completed", "failed", "cancelled"]
+    created_at: str
+
+
+class DelegationRecord(TypedDict):
+    """Auditable lifecycle record for one delegated subagent task."""
+
+    id: str
+    delegated_task_id: str
+    agent_id: str
+    agent_role: str
+    status: Literal["started", "tool_running", "completed", "failed", "timed_out"]
+    tool_invocation_refs: list[str]
+    evidence_refs: list[str]
+    started_at: str
+    completed_at: Optional[str]
+    summary: str
+
+
+class DelegationResult(TypedDict):
+    """Structured output returned by a controlled subagent."""
+
+    id: str
+    delegated_task_id: str
+    agent_id: str
+    status: Literal["succeeded", "failed", "needs_review"]
+    summary: str
+    findings: list[dict[str, Any]]
+    evidence_refs: list[str]
+    sql_used: list[str]
+    recommended_actions: list[dict[str, Any]]
+    risk_level: Literal["low", "medium", "high", "critical"]
+    confidence: float
+    open_questions: list[str]
+    requires_human_review: bool
+    created_at: str
+
+
+class DelegationFailure(TypedDict):
+    """Recoverable failure record for a delegated task."""
+
+    id: str
+    delegated_task_id: str
+    agent_role: str
+    failure_type: Literal["timeout", "tool_denied", "permission_missing", "invalid_output", "runtime_error"]
+    message: str
+    recoverable: bool
+    suggested_action: Literal["retry", "narrow_scope", "ask_user", "fallback_to_main", "skip_branch"]
+    created_at: str
+
+
+class DelegationEvaluation(TypedDict):
+    """Quality evaluation for one DelegationResult."""
+
+    id: str
+    delegated_task_id: str
+    result_id: str
+    status: Literal["passed", "failed", "needs_review"]
+    checks: list[dict[str, Any]]
+    failed_checks: list[str]
+    evidence_completeness: float
+    conclusion_supported: bool
+    safety_compliant: bool
+    reviewer_notes: list[str]
+    created_at: str
+
+
+class AgentTeamRun(TypedDict):
+    """Coordinator-level snapshot for a group of delegated subagent tasks."""
+
+    id: str
+    parent_task_id: str
+    coordinator_agent_id: str
+    delegated_task_ids: list[str]
+    active_agent_ids: list[str]
+    status: Literal["planning", "running", "waiting_review", "completed", "failed"]
+    concurrency_limit: int
+    started_at: str
+    completed_at: Optional[str]
+    summary: str
 
 
 class StepContextPacket(TypedDict):
@@ -1096,6 +1229,14 @@ class AgentState(TypedDict):
     evaluation_results: NotRequired[Annotated[list[EvaluationResult], operator.add]]
     replay_cases: NotRequired[Annotated[list[ReplayCase], operator.add]]
     quality_reports: NotRequired[Annotated[list[QualityReport], operator.add]]
+    agent_roles: NotRequired[list[AgentRoleDefinition]]
+    delegation_policy_decisions: NotRequired[Annotated[list[DelegationPolicyDecision], operator.add]]
+    delegated_tasks: NotRequired[Annotated[list[DelegatedTask], operator.add]]
+    delegation_records: NotRequired[Annotated[list[DelegationRecord], operator.add]]
+    delegation_results: NotRequired[Annotated[list[DelegationResult], operator.add]]
+    delegation_failures: NotRequired[Annotated[list[DelegationFailure], operator.add]]
+    delegation_evaluations: NotRequired[Annotated[list[DelegationEvaluation], operator.add]]
+    agent_team_runs: NotRequired[Annotated[list[AgentTeamRun], operator.add]]
 
     # Human-readable plan summary injected into system prompt.
     plan: Optional[str]

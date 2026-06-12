@@ -22,6 +22,7 @@ CLARIFICATION_GATE = "clarification_gate"
 WORKFLOW_PLANNER = "workflow_planner"
 STATE_RECOVERY = "state_recovery"
 TASK_PLANNER = "task_planner"
+DELEGATION_PLANNER = "delegation_planner"
 STEP_SCHEDULER = "step_scheduler"
 MEMORY_COMPACTOR = "memory_compactor"
 LLM_REASON = "llm_reason"
@@ -91,13 +92,22 @@ def route_after_workflow_planner(
 
 def route_after_planner(
     state: AgentState,
-) -> Literal["step_scheduler", "memory_compactor", "error_handler"]:
+) -> Literal["delegation_planner", "memory_compactor", "error_handler"]:
     """After task planning: check for errors, then determine next step."""
     if state.get("error"):
         return ERROR_HANDLER
     if state.get("db_task_plan") or state.get("task_stack"):
-        return STEP_SCHEDULER
+        return DELEGATION_PLANNER
     return MEMORY_COMPACTOR
+
+
+def route_after_delegation_planner(
+    state: AgentState,
+) -> Literal["step_scheduler", "error_handler"]:
+    """After delegation planning: schedule the next executable step."""
+    if state.get("error"):
+        return ERROR_HANDLER
+    return STEP_SCHEDULER
 
 
 def route_after_scheduler(

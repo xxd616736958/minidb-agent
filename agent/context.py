@@ -610,6 +610,91 @@ def build_prompt_context(state: AgentState) -> tuple[str, StepContextPacket | No
             )
         )
 
+    delegation_decisions = state.get("delegation_policy_decisions", [])[-5:]
+    delegated_tasks = state.get("delegated_tasks", [])[-8:]
+    delegation_records = state.get("delegation_records", [])[-8:]
+    delegation_results = state.get("delegation_results", [])[-5:]
+    delegation_evaluations = state.get("delegation_evaluations", [])[-5:]
+    agent_team_runs = state.get("agent_team_runs", [])[-3:]
+    if delegation_decisions or delegated_tasks or delegation_records or delegation_results or delegation_evaluations or agent_team_runs:
+        sections.append(
+            "## Multi-Agent Delegation\n"
+            + json.dumps(
+                {
+                    "recent_policy_decisions": [
+                        {
+                            "step_id": item.get("step_id"),
+                            "decision": item.get("decision"),
+                            "selected_roles": item.get("selected_roles", []),
+                            "reason": item.get("reason"),
+                            "blocked_reasons": item.get("blocked_reasons", []),
+                        }
+                        for item in delegation_decisions
+                    ],
+                    "recent_delegated_tasks": [
+                        {
+                            "id": item.get("id"),
+                            "parent_step_id": item.get("parent_step_id"),
+                            "agent_role": item.get("agent_role"),
+                            "status": item.get("status"),
+                            "risk_level": item.get("risk_level"),
+                            "allowed_tools": item.get("allowed_tools", [])[:8],
+                            "forbidden_actions": item.get("forbidden_actions", [])[:6],
+                            "success_criteria": item.get("success_criteria", [])[:4],
+                        }
+                        for item in delegated_tasks
+                    ],
+                    "recent_records": [
+                        {
+                            "delegated_task_id": item.get("delegated_task_id"),
+                            "agent_role": item.get("agent_role"),
+                            "status": item.get("status"),
+                            "tool_invocation_refs": item.get("tool_invocation_refs", []),
+                            "evidence_refs": item.get("evidence_refs", []),
+                            "summary": item.get("summary"),
+                        }
+                        for item in delegation_records
+                    ],
+                    "recent_results": [
+                        {
+                            "id": item.get("id"),
+                            "delegated_task_id": item.get("delegated_task_id"),
+                            "status": item.get("status"),
+                            "summary": item.get("summary"),
+                            "evidence_refs": item.get("evidence_refs", []),
+                            "risk_level": item.get("risk_level"),
+                            "confidence": item.get("confidence"),
+                            "requires_human_review": item.get("requires_human_review"),
+                        }
+                        for item in delegation_results
+                    ],
+                    "recent_evaluations": [
+                        {
+                            "delegated_task_id": item.get("delegated_task_id"),
+                            "result_id": item.get("result_id"),
+                            "status": item.get("status"),
+                            "failed_checks": item.get("failed_checks", []),
+                            "evidence_completeness": item.get("evidence_completeness"),
+                            "safety_compliant": item.get("safety_compliant"),
+                        }
+                        for item in delegation_evaluations
+                    ],
+                    "recent_team_runs": [
+                        {
+                            "id": item.get("id"),
+                            "status": item.get("status"),
+                            "delegated_task_ids": item.get("delegated_task_ids", []),
+                            "concurrency_limit": item.get("concurrency_limit"),
+                            "summary": item.get("summary"),
+                        }
+                        for item in agent_team_runs
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+
     quality_gates = state.get("quality_gates", [])[-5:]
     evaluation_results = state.get("evaluation_results", [])[-5:]
     replay_cases = state.get("replay_cases", [])[-3:]

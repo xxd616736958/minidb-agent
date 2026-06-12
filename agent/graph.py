@@ -22,6 +22,7 @@ from agent.edges.routes import (
     INTENT_ANALYZER,
     INTENT_VALIDATOR,
     CLARIFICATION_GATE,
+    DELEGATION_PLANNER,
     WORKFLOW_PLANNER,
     STATE_RECOVERY,
     LLM_REASON,
@@ -37,6 +38,7 @@ from agent.edges.routes import (
     route_after_approval,
     route_after_clarification,
     route_after_compactor,
+    route_after_delegation_planner,
     route_after_error_handler,
     route_after_intent_analyzer,
     route_after_intent_validator,
@@ -56,6 +58,7 @@ from agent.nodes.agent_loop import (
     tool_policy_gate,
     verify_step,
 )
+from agent.nodes.delegation_planner import delegation_planner
 from agent.nodes.error_handler import error_handler
 from agent.nodes.human_approval import human_approval
 from agent.nodes.intent import (
@@ -108,6 +111,7 @@ def build_graph() -> StateGraph:
     builder.add_node(WORKFLOW_PLANNER, workflow_planner)
     builder.add_node(STATE_RECOVERY, recover_state)
     builder.add_node(TASK_PLANNER, task_planner)
+    builder.add_node(DELEGATION_PLANNER, delegation_planner)
     builder.add_node(STEP_SCHEDULER, step_scheduler)
     builder.add_node(MEMORY_COMPACTOR, memory_compactor)
     builder.add_node(LLM_REASON, llm_reason)
@@ -174,8 +178,17 @@ def build_graph() -> StateGraph:
         TASK_PLANNER,
         route_after_planner,
         {
-            "step_scheduler": STEP_SCHEDULER,
+            "delegation_planner": DELEGATION_PLANNER,
             "memory_compactor": MEMORY_COMPACTOR,
+            "error_handler": ERROR_HANDLER,
+        },
+    )
+
+    builder.add_conditional_edges(
+        DELEGATION_PLANNER,
+        route_after_delegation_planner,
+        {
+            "step_scheduler": STEP_SCHEDULER,
             "error_handler": ERROR_HANDLER,
         },
     )

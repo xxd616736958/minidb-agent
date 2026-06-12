@@ -5,6 +5,7 @@ import pytest
 from agent.state import AgentState, TaskStep
 from agent.edges.routes import (
     route_after_llm,
+    route_after_delegation_planner,
     route_after_planner,
     route_after_start,
     route_after_intent_validator,
@@ -24,6 +25,8 @@ from agent.edges.routes import (
     EXECUTE_TOOLS,
     ERROR_HANDLER,
     MEMORY_COMPACTOR,
+    DELEGATION_PLANNER,
+    STEP_SCHEDULER,
 )
 
 
@@ -198,6 +201,15 @@ class TestRouting:
         """No error → memory_compactor."""
         state = self._make_state()
         assert route_after_planner(state) == MEMORY_COMPACTOR
+
+    def test_route_after_planner_with_plan_enters_delegation_planner(self):
+        """Planned tasks should pass through delegation planning before scheduling."""
+        state = self._make_state(task_stack=[{"id": "observe", "status": "pending"}])
+        assert route_after_planner(state) == DELEGATION_PLANNER
+
+    def test_route_after_delegation_planner_enters_scheduler(self):
+        state = self._make_state()
+        assert route_after_delegation_planner(state) == STEP_SCHEDULER
 
     def test_route_after_planner_with_error(self):
         """Error → error_handler."""

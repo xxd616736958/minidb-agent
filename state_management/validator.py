@@ -126,6 +126,53 @@ class StateValidator:
                     errors.append("active_recovery_decision requests auto_retry but retry budget is exhausted.")
                     repair_actions.append("Switch recovery decision to ask_user, replan_step, or abort_safely.")
 
+        role_names = {role.get("name") for role in state.get("agent_roles", [])}
+        delegated_task_ids = {task.get("id") for task in state.get("delegated_tasks", [])}
+        write_tool_names = {
+            "postgres_execute_write",
+            "postgres_analyze_table",
+            "postgres_vacuum_table",
+            "postgres_create_index_concurrently",
+            "shell_execute",
+        }
+        for task in state.get("delegated_tasks", []):
+            task_id = task.get("id")
+            role_name = task.get("agent_role")
+            parent_step_id = task.get("parent_step_id")
+            if role_names and role_name not in role_names:
+                errors.append(f"delegated_task '{task_id}' references unknown agent role '{role_name}'.")
+                repair_actions.append("Regenerate delegated task from current AgentRoleDefinition.")
+            if parent_step_id and step_ids and parent_step_id not in step_ids:
+                errors.append(f"delegated_task '{task_id}' references missing parent step '{parent_step_id}'.")
+                repair_actions.append("Cancel stale delegated task or re-run delegation planning.")
+            allowed_tools = set(task.get("allowed_tools", []) or [])
+            if allowed_tools & write_tool_names:
+                errors.append(f"delegated_task '{task_id}' exposes write-capable tools to subagent.")
+                repair_actions.append("Filter delegated task tools through AgentRoleDefinition.")
+            if task.get("risk_level") in {"high", "critical"} and task.get("agent_role") != "safety_reviewer":
+                warnings.append(f"delegated_task '{task_id}' is high risk and should be reviewed by safety_reviewer.")
+                repair_actions.append("Create a safety_reviewer delegated task before approval.")
+
+        for result in state.get("delegation_results", []):
+            task_id = result.get("delegated_task_id")
+            if task_id and task_id not in delegated_task_ids:
+                errors.append(f"delegation_result '{result.get('id')}' references missing delegated task '{task_id}'.")
+                repair_actions.append("Drop stale delegation result or restore the delegated task record.")
+            if result.get("requires_human_review"):
+                has_eval = any(
+                    evaluation.get("result_id") == result.get("id")
+                    for evaluation in state.get("delegation_evaluations", [])
+                )
+                if not has_eval:
+                    warnings.append(f"delegation_result '{result.get('id')}' requires review but has no evaluation.")
+                    repair_actions.append("Run delegation evaluation before using the result.")
+
+        for evaluation in state.get("delegation_evaluations", []):
+            result_id = evaluation.get("result_id")
+            if result_id and not any(result.get("id") == result_id for result in state.get("delegation_results", [])):
+                warnings.append(f"delegation_evaluation '{evaluation.get('id')}' references missing result '{result_id}'.")
+                repair_actions.append("Regenerate delegation evaluation from current result.")
+
         return {
             "ok": not errors,
             "errors": errors,
