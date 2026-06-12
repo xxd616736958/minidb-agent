@@ -230,6 +230,7 @@ def build_db_working_set(state: AgentState) -> DBWorkingSet | None:
     schemas = set(existing.get("schemas", []))
     indexes = dict(existing.get("indexes", {}))
     row_counts = dict(existing.get("row_counts", {}))
+    source_observation_ids = list(existing.get("source_observation_ids", []))
 
     for obj in target_objects:
         name = str(obj.get("name", ""))
@@ -246,6 +247,11 @@ def build_db_working_set(state: AgentState) -> DBWorkingSet | None:
         if isinstance(artifact, dict) and artifact.get("type") in {"sql", "query"}:
             known_queries.append(artifact)
 
+    for obs in state.get("db_observations", [])[-MAX_CONTEXT_OBSERVATIONS:]:
+        obs_id = obs.get("id")
+        if obs_id and obs_id not in source_observation_ids:
+            source_observation_ids.append(obs_id)
+
     return {
         "target_environment": str(intent.get("target_environment") or existing.get("target_environment") or "unknown"),
         "target_database": intent.get("target_database") or existing.get("target_database"),
@@ -257,6 +263,8 @@ def build_db_working_set(state: AgentState) -> DBWorkingSet | None:
         "row_counts": row_counts,
         "statistics_refs": list(existing.get("statistics_refs", [])),
         "last_refreshed_at": now_iso(),
+        "source_observation_ids": source_observation_ids[-20:],
+        "stale_reason": existing.get("stale_reason"),
     }
 
 
@@ -361,6 +369,30 @@ def build_prompt_context(state: AgentState) -> tuple[str, StepContextPacket | No
                     "schemas": working_set.get("schemas", []),
                     "tables": working_set.get("tables", []),
                     "known_queries_count": len(working_set.get("known_queries", [])),
+                    "source_observation_ids": working_set.get("source_observation_ids", []),
+                    "stale_reason": working_set.get("stale_reason"),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+
+    runtime = state.get("db_task_runtime")
+    integrity_reports = state.get("state_integrity_reports", [])
+    recovery_summary = state.get("recovery_summary")
+    if runtime or integrity_reports or recovery_summary:
+        latest_integrity = integrity_reports[-1] if integrity_reports else None
+        sections.append(
+            "## State Management\n"
+            + json.dumps(
+                {
+                    "runtime": runtime,
+                    "recovery_summary": recovery_summary,
+                    "latest_integrity": {
+                        "ok": (latest_integrity or {}).get("ok"),
+                        "errors": (latest_integrity or {}).get("errors", []),
+                        "warnings": (latest_integrity or {}).get("warnings", []),
+                    } if latest_integrity else None,
                 },
                 ensure_ascii=False,
                 indent=2,

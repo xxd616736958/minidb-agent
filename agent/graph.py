@@ -23,6 +23,7 @@ from agent.edges.routes import (
     INTENT_VALIDATOR,
     CLARIFICATION_GATE,
     WORKFLOW_PLANNER,
+    STATE_RECOVERY,
     LLM_REASON,
     EXECUTE_TOOLS,
     HUMAN_APPROVAL,
@@ -65,6 +66,7 @@ from agent.nodes.intent import (
 )
 from agent.nodes.llm_node import llm_reason
 from agent.nodes.memory_compactor import memory_compactor
+from agent.nodes.state_node import recover_state
 from agent.nodes.task_planner import task_planner
 from agent.nodes.tool_executor import execute_tools
 from agent.state import AgentState
@@ -104,6 +106,7 @@ def build_graph() -> StateGraph:
     builder.add_node(INTENT_VALIDATOR, intent_validator)
     builder.add_node(CLARIFICATION_GATE, clarification_gate)
     builder.add_node(WORKFLOW_PLANNER, workflow_planner)
+    builder.add_node(STATE_RECOVERY, recover_state)
     builder.add_node(TASK_PLANNER, task_planner)
     builder.add_node(STEP_SCHEDULER, step_scheduler)
     builder.add_node(MEMORY_COMPACTOR, memory_compactor)
@@ -117,9 +120,10 @@ def build_graph() -> StateGraph:
 
     # ── Add edges ────────────────────────────────────────
 
-    # Entry: understand intent before planning
+    # Entry: recover/migrate state, then understand intent before planning.
+    builder.add_edge(START, STATE_RECOVERY)
     builder.add_conditional_edges(
-        START,
+        STATE_RECOVERY,
         route_after_start,
         {
             "intent_analyzer": INTENT_ANALYZER,

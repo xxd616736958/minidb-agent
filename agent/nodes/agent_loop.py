@@ -18,6 +18,8 @@ from agent.context import (
 from agent.state import AgentState, DBObservation, ResultDigest, TaskStep, VerificationResult
 from execution.environment import ArtifactStore, ExecutionEnvironmentManager
 from memory.consolidator import consolidate_memories
+from state_management.manager import StateManager
+from state_management.validator import StateValidator
 from tools.policy import evaluate_tool_calls, make_invocation_record, tool_call_items
 
 logger = logging.getLogger(__name__)
@@ -27,10 +29,7 @@ def _now_iso() -> str:
 
 
 def _plan_steps(state: AgentState) -> list[TaskStep]:
-    plan = state.get("db_task_plan")
-    if plan and plan.get("steps"):
-        return list(plan["steps"])
-    return list(state.get("task_stack", []))
+    return StateManager(state).plan_steps()
 
 
 def _completed_ids(steps: list[TaskStep]) -> set[str]:
@@ -42,11 +41,7 @@ def _completed_ids(steps: list[TaskStep]) -> set[str]:
 
 
 def _find_current_index(steps: list[TaskStep], current_step_id: str | None) -> int:
-    if current_step_id:
-        for idx, step in enumerate(steps):
-            if step.get("id") == current_step_id:
-                return idx
-    return 0
+    return StateManager({"current_step_id": current_step_id, "current_task_index": 0}).find_step_index(steps, current_step_id)
 
 
 def _sync_plan_and_stack(
@@ -55,21 +50,7 @@ def _sync_plan_and_stack(
     current_idx: int | None = None,
     plan_status: str | None = None,
 ) -> dict[str, Any]:
-    update: dict[str, Any] = {
-        "task_stack": steps,
-    }
-    if current_idx is not None:
-        update["current_task_index"] = current_idx
-
-    plan = state.get("db_task_plan")
-    if plan:
-        plan = dict(plan)
-        plan["steps"] = steps
-        plan["updated_at"] = _now_iso()
-        if plan_status:
-            plan["status"] = plan_status
-        update["db_task_plan"] = plan
-    return update
+    return StateManager(state).sync_plan_and_stack(steps, current_idx, plan_status)
 
 
 def step_scheduler(state: AgentState) -> dict[str, Any]:
@@ -79,16 +60,24 @@ def step_scheduler(state: AgentState) -> dict[str, Any]:
 
     steps = _plan_steps(state)
     if not steps:
-        return {"loop_status": "completed", "current_step_id": None}
+        update = {"loop_status": "completed", "current_step_id": None}
+        next_state = {**state, **update}
+        update.update(StateManager(next_state).runtime_update(last_node="step_scheduler"))
+        update.update(StateValidator(next_state).validation_update())
+        return update
 
     completed = _completed_ids(steps)
     blocked = [step for step in steps if step.get("status") == "failed"]
     if blocked:
-        return {
+        update = {
             "loop_status": "blocked",
             "current_step_id": blocked[0]["id"],
             "replan_trigger": "step_failed",
         }
+        next_state = {**state, **update}
+        update.update(StateManager(next_state).runtime_update(last_node="step_scheduler"))
+        update.update(StateValidator(next_state).validation_update())
+        return update
 
     for idx, step in enumerate(steps):
         if step.get("status") not in {"pending", "running"}:
@@ -112,6 +101,8 @@ def step_scheduler(state: AgentState) -> dict[str, Any]:
                 "loop_status": "running",
                 "policy_violation": None,
                 "step_context": build_step_context_packet(next_state),
+                **StateManager(next_state).runtime_update(last_node="step_scheduler"),
+                **StateValidator(next_state).validation_update(),
             }
         )
         return update
@@ -122,12 +113,17 @@ def step_scheduler(state: AgentState) -> dict[str, Any]:
             **_sync_plan_and_stack(state, steps, None, "completed"),
             "loop_status": "completed",
             "current_step_id": None,
+            **StateManager({**state, "loop_status": "completed", "current_step_id": None}).runtime_update(last_node="step_scheduler"),
         }
 
-    return {
+    blocked_update = {
         "loop_status": "blocked",
         "replan_trigger": "no_runnable_step",
     }
+    blocked_state = {**state, **blocked_update}
+    blocked_update.update(StateManager(blocked_state).runtime_update(last_node="step_scheduler"))
+    blocked_update.update(StateValidator(blocked_state).validation_update())
+    return blocked_update
 
 
 def _current_step_from_state(state: AgentState) -> TaskStep | None:
@@ -180,6 +176,8 @@ def tool_policy_gate(state: AgentState) -> dict[str, Any]:
             "tool_invocation_records": records,
             "step_context": packet,
             **environment_update,
+            **StateManager({**policy_state, **environment_update}).runtime_update(last_node="tool_policy_gate"),
+            **StateValidator({**policy_state, **environment_update}).validation_update(),
         }
 
     violation = blocked[0]["reason"]
@@ -196,7 +194,7 @@ def tool_policy_gate(state: AgentState) -> dict[str, Any]:
         f"Blocked tools: {', '.join(tool_names)}\n"
         "Continue the current step without these tools, or explain what information is missing."
     )
-    return {
+    result = {
         "messages": [last_msg, AIMessage(content=content)],
         "policy_violation": {
             "step_id": (current_step or {}).get("id"),
@@ -212,6 +210,10 @@ def tool_policy_gate(state: AgentState) -> dict[str, Any]:
         **environment_update,
         "loop_status": "blocked" if policy == "write_tools_after_approval" else "running",
     }
+    blocked_state = {**policy_state, **environment_update, **{"loop_status": "blocked" if policy == "write_tools_after_approval" else "running"}}
+    result.update(StateManager(blocked_state).runtime_update(last_node="tool_policy_gate"))
+    result.update(StateValidator(blocked_state).validation_update())
+    return result
 
 
 def _observation_type(name: str, content: str) -> str:
@@ -301,10 +303,12 @@ def normalize_observation(state: AgentState) -> dict[str, Any]:
         "db_observations": [*state.get("db_observations", []), *observations],
         "result_digests": [*state.get("result_digests", []), *digests],
     }
+    manager_update = StateManager(state).record_observations(observations, digests)
+    snapshot_state = {**snapshot_state, **manager_update}
     return {
-        "db_observations": observations,
-        "result_digests": digests,
+        **manager_update,
         "context_snapshots": [build_context_snapshot(snapshot_state)],
+        **StateValidator(snapshot_state).validation_update(),
     }
 
 
@@ -384,14 +388,14 @@ def verify_step(state: AgentState) -> dict[str, Any]:
     memory_updates = consolidate_memories(snapshot_state) if status == "passed" else {}
     update.update(
         {
-            "verification_results": [result],
             "loop_status": "blocked" if status in {"failed", "blocked"} else "running",
             "replan_trigger": "verification_blocked" if status in {"failed", "blocked"} else None,
             "step_context": build_step_context_packet(snapshot_state),
             "context_snapshots": [build_context_snapshot(snapshot_state)],
-            "artifact_records": [verification_artifact],
-            **environment_update,
+            **StateManager(state).record_verification(result, verification_artifact, environment_update),
             **memory_updates,
         }
     )
+    final_state = {**state, **update}
+    update.update(StateValidator(final_state).validation_update())
     return update

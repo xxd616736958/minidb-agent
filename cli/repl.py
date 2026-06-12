@@ -255,7 +255,7 @@ class AgentRepl:
                 elif plan:
                     print_plan(plan)
 
-            elif node_name in ("step_scheduler", "normalize_observation", "verify_step", "tool_policy_gate"):
+            elif node_name in ("state_recovery", "step_scheduler", "normalize_observation", "verify_step", "tool_policy_gate"):
                 if isinstance(output, dict):
                     print_loop_status(node_name, output)
 

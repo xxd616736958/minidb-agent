@@ -180,7 +180,14 @@ def print_loop_status(label: str, payload: dict[str, Any]):
     """Display concise Agent Loop status updates."""
     if not payload:
         return
-    if label == "step_scheduler":
+    if label == "state_recovery":
+        _print_state_runtime(payload)
+        summary = payload.get("recovery_summary")
+        if summary:
+            console.print(f"[dim]Recovery:[/dim] {summary}")
+        _print_integrity(payload)
+    elif label == "step_scheduler":
+        _print_state_runtime(payload)
         step_id = payload.get("current_step_id")
         status = payload.get("loop_status")
         if step_id:
@@ -188,6 +195,7 @@ def print_loop_status(label: str, payload: dict[str, Any]):
         elif status:
             console.print(f"[dim]Loop:[/dim] {status}")
     elif label == "verify_step":
+        _print_state_runtime(payload)
         results = payload.get("verification_results") or []
         for result in results:
             console.print(
@@ -202,6 +210,7 @@ def print_loop_status(label: str, payload: dict[str, Any]):
                 f"{str(obs.get('summary', ''))[:100]}"
             )
     elif label == "tool_policy_gate":
+        _print_state_runtime(payload)
         decisions = payload.get("tool_policy_decisions") or []
         for decision in decisions:
             console.print(
@@ -209,11 +218,13 @@ def print_loop_status(label: str, payload: dict[str, Any]):
                 f"{decision.get('decision')} - {str(decision.get('reason', ''))[:100]}"
             )
     elif label == "llm_reason":
+        _print_state_runtime(payload)
         _print_execution_environment(payload)
         tools = payload.get("available_tools") or []
         if tools:
             console.print(f"[dim]Available tools:[/dim] {', '.join(str(tool) for tool in tools)}")
     elif label == "execute_tools":
+        _print_state_runtime(payload)
         _print_execution_environment(payload)
         artifacts = payload.get("artifact_records") or []
         for artifact in artifacts:
@@ -228,6 +239,34 @@ def print_loop_status(label: str, payload: dict[str, Any]):
             f"[dim]↳ Memory:[/dim] [cyan]{memory.get('kind')}[/cyan] "
             f"{str(memory.get('summary', ''))[:100]}"
         )
+
+
+def _print_integrity(payload: dict[str, Any]) -> None:
+    reports = payload.get("state_integrity_reports") or []
+    if not reports:
+        return
+    latest = reports[-1]
+    if latest.get("ok"):
+        return
+    errors = latest.get("errors") or []
+    warnings = latest.get("warnings") or []
+    if errors:
+        console.print(f"[dim]State check:[/dim] [red]{str(errors[0])[:120]}[/red]")
+    elif warnings:
+        console.print(f"[dim]State check:[/dim] [yellow]{str(warnings[0])[:120]}[/yellow]")
+
+
+def _print_state_runtime(payload: dict[str, Any]) -> None:
+    runtime = payload.get("db_task_runtime") or {}
+    if not runtime:
+        return
+    console.print(
+        "[dim]State:[/dim] "
+        f"[cyan]{runtime.get('task_status', 'unknown')}[/cyan] "
+        f"[dim]phase={runtime.get('current_phase') or 'none'} "
+        f"step={runtime.get('current_step_id') or 'none'} "
+        f"risk={runtime.get('risk_level') or 'unknown'}[/dim]"
+    )
 
 
 def _print_execution_environment(payload: dict[str, Any]) -> None:

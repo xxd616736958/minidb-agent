@@ -18,6 +18,8 @@ from langchain_core.messages import ToolMessage
 
 from agent.state import AgentState
 from execution.environment import ArtifactStore, ExecutionEnvironmentManager
+from state_management.manager import StateManager
+from state_management.validator import StateValidator
 from tools.postgres.results import loads_result
 from tools.registry import registry
 
@@ -239,15 +241,11 @@ def execute_tools(state: AgentState) -> dict[str, Any]:
         )
         for result in structured_results
     ]
-    if artifact_records and environment_update.get("task_workspace"):
-        task_workspace = dict(environment_update["task_workspace"])
-        existing_artifact_ids = list(task_workspace.get("artifact_ids", []))
-        task_workspace["artifact_ids"] = [
-            *existing_artifact_ids,
-            *(artifact["id"] for artifact in artifact_records),
-        ]
-        task_workspace["updated_at"] = datetime.now(timezone.utc).isoformat()
-        environment_update["task_workspace"] = task_workspace
+    workspace_update = StateManager(state).record_artifacts_on_task_workspace(
+        artifact_records,
+        environment_update.get("task_workspace"),
+    )
+    environment_update.update(workspace_update)
 
     # Keep task running; verify_step decides completion after observations are
     # normalized and checked against success criteria.
@@ -269,14 +267,24 @@ def execute_tools(state: AgentState) -> dict[str, Any]:
         db_task_plan["steps"] = plan_steps
         db_task_plan["updated_at"] = datetime.now(timezone.utc).isoformat()
 
-    return {
+    replay_policies = [
+        StateManager(state).replay_policy_for_tool(str(result.get("tool_name") or ""), str(result.get("tool_call_id") or ""))
+        for result in structured_results
+        if result.get("tool_call_id")
+    ]
+    final_update = {
         "messages": new_messages,
         "tool_call_results": tool_results,
         "tool_execution_results": structured_results,
         "tool_invocation_records": _update_invocation_records(state, structured_results, artifact_records),
         "artifact_records": artifact_records,
+        "replay_policies": replay_policies,
         **environment_update,
         "task_stack": task_stack,
         "db_task_plan": db_task_plan,
         "step_count": state.get("step_count", 0) + 1,
     }
+    next_state = {**state, **final_update}
+    final_update.update(StateManager(next_state).runtime_update(last_node="execute_tools"))
+    final_update.update(StateValidator(next_state).validation_update())
+    return final_update

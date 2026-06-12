@@ -186,8 +186,10 @@ class ApprovalDecision(TypedDict):
     risk_level: Literal["low", "medium", "high", "critical"]
     target_environment: str
     sql_preview: Optional[str]
+    sql_hash: NotRequired[Optional[str]]
     impact_summary: Optional[str]
     rollback_summary: Optional[str]
+    verification_criteria: NotRequired[list[str]]
     user_message: Optional[str]
     created_at: str
     resolved_at: Optional[str]
@@ -236,6 +238,8 @@ class DBWorkingSet(TypedDict):
     row_counts: dict[str, int]
     statistics_refs: list[str]
     last_refreshed_at: str
+    source_observation_ids: NotRequired[list[str]]
+    stale_reason: NotRequired[Optional[str]]
 
 
 class ResultDigest(TypedDict):
@@ -346,6 +350,51 @@ class RuntimePolicy(TypedDict):
     require_approval_for_database_write: bool
     max_tool_duration_seconds: int
     max_artifact_size_bytes: int
+
+
+class StateMetadata(TypedDict):
+    """Versioned state metadata for checkpoint recovery and migration."""
+
+    schema_version: int
+    session_id: str
+    created_at: str
+    updated_at: str
+    last_node: Optional[str]
+    last_transition: Optional[str]
+    recovery_mode: Literal["normal", "resumed", "forked", "migrated"]
+
+
+class DBTaskRuntimeState(TypedDict):
+    """Current PostgreSQL task runtime snapshot derived from state."""
+
+    intent_id: Optional[str]
+    plan_id: Optional[str]
+    current_step_id: Optional[str]
+    current_phase: Optional[str]
+    target_environment: str
+    target_database: Optional[str]
+    risk_level: str
+    task_status: Literal["new", "planning", "running", "waiting", "blocked", "completed"]
+    blocked_reason: Optional[str]
+
+
+class StateIntegrityReport(TypedDict):
+    """State consistency report emitted by StateValidator."""
+
+    ok: bool
+    errors: list[str]
+    warnings: list[str]
+    repair_actions: list[str]
+    created_at: str
+
+
+class ReplayPolicy(TypedDict):
+    """Replay safety policy for a historical tool invocation."""
+
+    tool_call_id: str
+    replayable: bool
+    reason: str
+    requires_new_approval: bool
 
 
 class MemoryRecord(TypedDict):
@@ -586,6 +635,12 @@ class AgentState(TypedDict):
     task_workspace: NotRequired[Optional[TaskWorkspace]]
     artifact_records: NotRequired[Annotated[list[ArtifactRecord], operator.add]]
     runtime_policy: NotRequired[Optional[RuntimePolicy]]
+    state_schema_version: NotRequired[int]
+    state_metadata: NotRequired[StateMetadata]
+    db_task_runtime: NotRequired[Optional[DBTaskRuntimeState]]
+    state_integrity_reports: NotRequired[Annotated[list[StateIntegrityReport], operator.add]]
+    replay_policies: NotRequired[Annotated[list[ReplayPolicy], operator.add]]
+    recovery_summary: NotRequired[Optional[str]]
 
     # Human-readable plan summary injected into system prompt.
     plan: Optional[str]
