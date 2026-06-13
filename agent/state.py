@@ -1415,11 +1415,13 @@ class AgentState(TypedDict):
     # Structured task understanding produced before planning.
     current_intent: NotRequired[Optional[DBTaskIntent]]
     intent_history: NotRequired[Annotated[list[DBTaskIntent], operator.add]]
+    intent_strategy: NotRequired[Optional[dict[str, Any]]]
     pending_clarification: NotRequired[Optional[ClarificationRequest]]
     confirmed_context: NotRequired[dict[str, Any]]
     selected_workflow: NotRequired[Optional[str]]
     db_task_plan: NotRequired[Optional[DBTaskPlan]]
     plan_history: NotRequired[Annotated[list[DBTaskPlan], operator.add]]
+    planning_strategy: NotRequired[Optional[dict[str, Any]]]
     replan_trigger: NotRequired[Optional[str]]
     task_card: NotRequired[Optional[TaskCard]]
     plan_review: NotRequired[Optional[PlanReview]]
@@ -1502,6 +1504,7 @@ class AgentState(TypedDict):
     model_routes: NotRequired[Annotated[list[ModelRoute], operator.add]]
     model_invocation_policies: NotRequired[Annotated[list[ModelInvocationPolicy], operator.add]]
     model_invocation_records: NotRequired[Annotated[list[ModelInvocationRecord], operator.add]]
+    model_bypass_records: NotRequired[Annotated[list[dict[str, Any]], operator.add]]
     model_fallback_decisions: NotRequired[Annotated[list[ModelFallbackDecision], operator.add]]
     model_evaluation_results: NotRequired[Annotated[list[ModelEvaluationResult], operator.add]]
 

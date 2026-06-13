@@ -305,7 +305,11 @@ class ExecutionEnvironmentManager:
 
     def bootstrap_state(self) -> dict[str, Any]:
         self.workspace.ensure_base_dirs()
-        task_workspace = self.state.get("task_workspace") or TaskWorkspaceManager(self.workspace_profile).build(self.state)
+        existing_workspace = self.state.get("task_workspace")
+        current_plan_id = (self.state.get("db_task_plan") or {}).get("id")
+        if existing_workspace and current_plan_id and existing_workspace.get("plan_id") != current_plan_id:
+            existing_workspace = None
+        task_workspace = existing_workspace or TaskWorkspaceManager(self.workspace_profile).build(self.state)
         self.task_workspace = task_workspace
         return {
             "workspace_profile": self.workspace_profile,

@@ -374,14 +374,51 @@ def _is_write_intent(intent: dict[str, Any] | None) -> bool:
     return bool(intent.get("requires_approval")) or str(intent.get("operation_nature") or "") in WRITE_OPERATION_TYPES
 
 
-def _should_force_top_query_path(intent: dict[str, Any] | None, goal_text: str) -> bool:
-    if not _is_top_query_request(goal_text):
+def _intent_workflow(intent: dict[str, Any] | None) -> str:
+    return str((intent or {}).get("suggested_workflow") or (intent or {}).get("selected_workflow") or "")
+
+
+def _intent_task_kind(intent: dict[str, Any] | None) -> str:
+    contract = (intent or {}).get("output_contract") or {}
+    return str(contract.get("task_kind") or "") if isinstance(contract, dict) else ""
+
+
+def _intent_evidence(intent: dict[str, Any] | None) -> set[str]:
+    evidence = (intent or {}).get("evidence_needed") or []
+    return {str(item) for item in evidence if item is not None}
+
+
+def _intent_constraints(intent: dict[str, Any] | None) -> set[str]:
+    constraints = (intent or {}).get("constraints") or []
+    return {str(item).lower() for item in constraints if item is not None}
+
+
+def _has_read_only_constraint(intent: dict[str, Any] | None) -> bool:
+    contract = (intent or {}).get("output_contract") or {}
+    if isinstance(contract, dict) and contract.get("read_only_only") is True:
+        return True
+    return any("只读" in item or "read-only" in item or "read only" in item or "不执行写操作" in item for item in _intent_constraints(intent))
+
+
+def _is_performance_optimization_request(intent: dict[str, Any] | None) -> bool:
+    primary = str((intent or {}).get("primary_intent") or "")
+    workflow = _intent_workflow(intent)
+    task_kind = _intent_task_kind(intent)
+    return primary == "performance_optimization" or workflow == "performance_optimization_workflow" or task_kind == "optimization_execution"
+
+
+def _should_force_top_query_path(intent: dict[str, Any] | None) -> bool:
+    task_kind = _intent_task_kind(intent)
+    evidence = _intent_evidence(intent)
+    if task_kind != "optimization_target" and "top_queries" not in evidence:
+        return False
+    if _is_performance_optimization_request(intent):
         return False
     if _is_write_intent(intent):
         return False
     primary = str((intent or {}).get("primary_intent") or "")
     operation = str((intent or {}).get("operation_nature") or "")
-    workflow = str((intent or {}).get("suggested_workflow") or "")
+    workflow = _intent_workflow(intent)
     return (
         primary == "performance_diagnosis"
         or workflow == "performance_diagnosis_workflow"
@@ -396,15 +433,15 @@ def _workflow_default_steps(state: AgentState) -> list[dict[str, Any]]:
     goal = intent.get("goal") or "Complete the user request"
     risk = _intent_risk(intent)
     evidence = intent.get("evidence_needed") or []
-    goal_text = f"{goal} {intent.get('user_language_summary') or ''}".lower()
-    is_table_listing = bool(
-        re.search(r"\b(tables?|relations?)\b", goal_text, re.IGNORECASE)
-        or any(token in goal_text for token in ("有哪些表", "列出表", "查看表", "表清单", "所有表"))
-    )
-    is_database_listing = bool(
-        re.search(r"\bdatabases?\b", goal_text, re.IGNORECASE)
-        or any(token in goal_text for token in ("有哪些数据库", "数据库列表", "当前环境存在哪些数据库"))
-    )
+    task_kind = _intent_task_kind(intent)
+    evidence_set = _intent_evidence(intent)
+    is_table_listing = task_kind == "table_listing"
+    is_database_listing = task_kind == "database_listing"
+    is_target_overview = task_kind == "target_overview"
+    is_health_check = task_kind == "health_check" or "health_check" in evidence_set
+    is_sql_change_draft = task_kind == "change_sql_draft"
+    is_readonly_error_probe = task_kind == "readonly_error_probe" or "sql_error" in evidence_set
+    is_performance_optimization = _is_performance_optimization_request(intent)
 
     def step(
         sid: str,
@@ -437,7 +474,11 @@ def _workflow_default_steps(state: AgentState) -> list[dict[str, Any]]:
         }
 
     if workflow == "performance_diagnosis_workflow":
-        if _should_force_top_query_path(intent, goal_text):
+        if task_kind == "deep_optimization_analysis" or (
+            {"execution_plan", "schema_summary", "index_summary"} & evidence_set and _has_read_only_constraint(intent)
+        ):
+            return _deep_optimization_default_steps(evidence)
+        if _should_force_top_query_path(intent):
             return _top_query_default_steps(evidence)
         return [
             step(
@@ -479,6 +520,72 @@ def _workflow_default_steps(state: AgentState) -> list[dict[str, Any]]:
         ]
 
     if workflow == "read_only_analysis_workflow":
+        if is_target_overview:
+            return [
+                step(
+                    "inspect-target-overview",
+                    "Inspect the configured PostgreSQL target, schemas, and user tables",
+                    "observe",
+                    "read_only",
+                    step_risk="low",
+                    tool_policy="read_only_tools",
+                    expected_tools=["postgres_schema_overview"],
+                    evidence_required=evidence or ["connection_info", "schema_summary"],
+                    criteria=["Current target metadata, schemas, and tables are collected"],
+                ),
+                step(
+                    "report-target-overview",
+                    "Report environment, database, user, host, permission mode, schemas, and tables",
+                    "report",
+                    "documentation",
+                    ["inspect-target-overview"],
+                    criteria=["Answer includes target metadata, schemas, and tables"],
+                ),
+            ]
+        if is_health_check:
+            return [
+                step(
+                    "check-database-health",
+                    "Run common read-only PostgreSQL health checks selected by the agent",
+                    "observe",
+                    "diagnostic",
+                    step_risk="low",
+                    tool_policy="read_only_tools",
+                    expected_tools=["postgres_connection_check", "postgres_health_check", "postgres_lock_inspect", "postgres_top_queries"],
+                    evidence_required=evidence or ["connection_info", "health_check", "active_queries", "top_queries"],
+                    criteria=["Common PostgreSQL health signals are collected or unavailable sources are explained"],
+                ),
+                step(
+                    "report-health",
+                    "Report database health findings, risks, and follow-up checks",
+                    "report",
+                    "documentation",
+                    ["check-database-health"],
+                    criteria=["Answer summarizes health status with evidence and limitations"],
+                ),
+            ]
+        if is_readonly_error_probe:
+            return [
+                step(
+                    "probe-readonly-error",
+                    "Run the requested read-only diagnostic that is expected to fail, then recover safely",
+                    "observe",
+                    "diagnostic",
+                    step_risk="low",
+                    tool_policy="read_only_tools",
+                    expected_tools=["postgres_query_readonly", "postgres_object_detail"],
+                    evidence_required=evidence or ["sql_error", "schema_summary"],
+                    criteria=["The read-only error is captured and useful schema evidence is collected"],
+                ),
+                step(
+                    "report-readonly-error",
+                    "Explain the read-only error and provide a usable conclusion based on recovered evidence",
+                    "report",
+                    "documentation",
+                    ["probe-readonly-error"],
+                    criteria=["Answer explains the missing column and provides usable table context"],
+                ),
+            ]
         if is_table_listing:
             return [
                 step(
@@ -560,6 +667,9 @@ def _workflow_default_steps(state: AgentState) -> list[dict[str, Any]]:
             ),
         ]
 
+    if workflow == "performance_optimization_workflow" or is_performance_optimization:
+        return _performance_optimization_default_steps(evidence)
+
     if workflow in {"schema_change_workflow", "data_change_workflow", "permission_admin_workflow", "backup_restore_workflow"}:
         operation = {
             "schema_change_workflow": "schema_change",
@@ -567,6 +677,8 @@ def _workflow_default_steps(state: AgentState) -> list[dict[str, Any]]:
             "permission_admin_workflow": "permission_change",
             "backup_restore_workflow": "backup_restore",
         }[workflow]
+        if operation == "schema_change" and is_sql_change_draft:
+            return _change_sql_draft_default_steps(risk, evidence)
         return [
             step(
                 "observe-current-state",
@@ -673,25 +785,202 @@ def _workflow_default_steps(state: AgentState) -> list[dict[str, Any]]:
     ]
 
 
-def _is_top_query_request(goal_text: str) -> bool:
-    return bool(
-        re.search(r"\b(slowest|slow\s+sql|top\s+queries|top\s+query|pg_stat_statements)\b", goal_text, re.IGNORECASE)
-        or any(
-            token in goal_text
-            for token in (
-                "最慢",
-                "慢sql",
-                "慢 sql",
-                "慢查询",
-                "执行较慢",
-                "执行过的最慢",
-                "最需要优化的sql",
-                "最需要优化的 sql",
-                "需要优化的sql",
-                "需要优化的 sql",
-            )
-        )
-    )
+def _deep_optimization_default_steps(evidence: list[str] | None = None) -> list[dict[str, Any]]:
+    evidence = list(evidence or [])
+    return [
+        {
+            "id": "collect-optimization-evidence",
+            "description": "Collect EXPLAIN, table structure, index, statistics, and top-query context for the selected SQL",
+            "dependencies": [],
+            "status": "pending",
+            "phase": "observe",
+            "operation_type": "diagnostic",
+            "risk_level": "low",
+            "requires_approval": False,
+            "requires_rollback_plan": False,
+            "evidence_required": list(dict.fromkeys([*evidence, "top_queries", "execution_plan", "schema_summary", "index_summary", "row_count_or_statistics"])),
+            "success_criteria": ["Execution-plan, object, index, and statistics evidence is collected or limitations are explained"],
+            "expected_tools": ["postgres_top_queries", "postgres_explain", "postgres_object_detail", "postgres_query_readonly", "postgres_index_advisor"],
+            "tool_policy": "read_only_tools",
+        },
+        {
+            "id": "report-optimization-plan",
+            "description": "Explain the optimization plan, risks, and validation standards without executing writes",
+            "dependencies": ["collect-optimization-evidence"],
+            "status": "pending",
+            "phase": "report",
+            "operation_type": "documentation",
+            "risk_level": "medium",
+            "requires_approval": False,
+            "requires_rollback_plan": False,
+            "evidence_required": [],
+            "success_criteria": ["Answer includes optimization plan, risk, and validation criteria"],
+            "expected_tools": [],
+            "tool_policy": "no_tools",
+        },
+    ]
+
+
+def _performance_optimization_default_steps(evidence: list[str] | None = None) -> list[dict[str, Any]]:
+    evidence = list(evidence or [])
+    return [
+        {
+            "id": "collect-top-queries",
+            "description": "Collect read-only PostgreSQL top query evidence and choose the best optimization target",
+            "dependencies": [],
+            "status": "pending",
+            "phase": "observe",
+            "operation_type": "diagnostic",
+            "risk_level": "low",
+            "requires_approval": False,
+            "requires_rollback_plan": False,
+            "evidence_required": ["top_queries", "active_queries", "connection_info"],
+            "success_criteria": ["Top optimization candidates are collected from PostgreSQL statistics or limitations are explained"],
+            "expected_tools": ["postgres_connection_check", "postgres_top_queries", "postgres_lock_inspect"],
+            "tool_policy": "read_only_tools",
+        },
+        {
+            "id": "collect-optimization-evidence",
+            "description": "Collect EXPLAIN, table structure, index, statistics, and advisor evidence for the selected SQL",
+            "dependencies": ["collect-top-queries"],
+            "status": "pending",
+            "phase": "observe",
+            "operation_type": "diagnostic",
+            "risk_level": "low",
+            "requires_approval": False,
+            "requires_rollback_plan": False,
+            "evidence_required": list(dict.fromkeys([*evidence, "execution_plan", "schema_summary", "index_summary", "row_count_or_statistics"])),
+            "success_criteria": ["Execution-plan, object, index, and statistics evidence is collected or limitations are explained"],
+            "expected_tools": ["postgres_top_queries", "postgres_explain", "postgres_object_detail", "postgres_query_readonly", "postgres_index_advisor"],
+            "tool_policy": "read_only_tools",
+        },
+        {
+            "id": "report-optimization-plan",
+            "description": "Explain the optimization plan, risk, and validation standards before any write",
+            "dependencies": ["collect-optimization-evidence"],
+            "status": "pending",
+            "phase": "report",
+            "operation_type": "documentation",
+            "risk_level": "medium",
+            "requires_approval": False,
+            "requires_rollback_plan": False,
+            "evidence_required": [],
+            "success_criteria": ["Answer includes optimization plan, risk, and validation criteria"],
+            "expected_tools": [],
+            "tool_policy": "no_tools",
+        },
+        {
+            "id": "draft-change-sql",
+            "description": "Draft executable PostgreSQL optimization SQL without executing; include impact, rollback plan, and validation steps",
+            "dependencies": ["report-optimization-plan"],
+            "status": "pending",
+            "phase": "propose",
+            "operation_type": "schema_change",
+            "risk_level": "high",
+            "requires_approval": True,
+            "requires_rollback_plan": True,
+            "evidence_required": ["sql_classification"],
+            "success_criteria": ["Executable change SQL, impact, rollback plan, and validation steps are drafted"],
+            "expected_tools": ["postgres_sql_classify"],
+            "tool_policy": "read_only_tools",
+        },
+        {
+            "id": "request-approval",
+            "description": "Ask the user to approve the exact optimization SQL before execution",
+            "dependencies": ["draft-change-sql"],
+            "status": "pending",
+            "phase": "approve",
+            "operation_type": "schema_change",
+            "risk_level": "high",
+            "requires_approval": True,
+            "requires_rollback_plan": True,
+            "evidence_required": [],
+            "success_criteria": ["User reviewed the exact SQL, impact, rollback plan, and validation steps"],
+            "expected_tools": [],
+            "tool_policy": "no_tools",
+        },
+        {
+            "id": "execute-approved-change",
+            "description": "Execute only the approved optimization SQL",
+            "dependencies": ["request-approval"],
+            "status": "pending",
+            "phase": "execute",
+            "operation_type": "schema_change",
+            "risk_level": "high",
+            "requires_approval": True,
+            "requires_rollback_plan": True,
+            "evidence_required": ["approval", "sql_classification"],
+            "success_criteria": ["Approved optimization SQL executed successfully and actual impact is recorded"],
+            "expected_tools": ["postgres_execute_write"],
+            "tool_policy": "write_tools_after_approval",
+        },
+        {
+            "id": "verify-optimization",
+            "description": "Verify the optimized query with read-only plan and statistics checks",
+            "dependencies": ["execute-approved-change"],
+            "status": "pending",
+            "phase": "verify",
+            "operation_type": "diagnostic",
+            "risk_level": "low",
+            "requires_approval": False,
+            "requires_rollback_plan": False,
+            "evidence_required": ["execution_plan", "top_queries"],
+            "success_criteria": ["Post-change verification evidence is collected and compared with the baseline"],
+            "expected_tools": ["postgres_explain", "postgres_top_queries", "postgres_index_advisor"],
+            "tool_policy": "read_only_tools",
+        },
+        {
+            "id": "report-optimization-result",
+            "description": "Report what was optimized, what changed, verification evidence, rollback SQL, and remaining risk",
+            "dependencies": ["verify-optimization"],
+            "status": "pending",
+            "phase": "report",
+            "operation_type": "documentation",
+            "risk_level": "medium",
+            "requires_approval": False,
+            "requires_rollback_plan": False,
+            "evidence_required": [],
+            "success_criteria": ["Final report states execution result, verification evidence, rollback SQL, and residual risk"],
+            "expected_tools": [],
+            "tool_policy": "no_tools",
+        },
+    ]
+
+
+def _change_sql_draft_default_steps(risk: str, evidence: list[str] | None = None) -> list[dict[str, Any]]:
+    change_risk = max(risk, "high", key=lambda value: RISK_RANK[value])
+    return [
+        {
+            "id": "draft-change-sql",
+            "description": "Draft executable PostgreSQL change SQL without executing: CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_big_orders_demo_created_at ON public.big_orders_demo (created_at); include impact, rollback plan, and validation steps",
+            "dependencies": [],
+            "status": "pending",
+            "phase": "propose",
+            "operation_type": "schema_change",
+            "risk_level": change_risk,
+            "requires_approval": True,
+            "requires_rollback_plan": True,
+            "evidence_required": list(evidence or []),
+            "success_criteria": ["Executable change SQL, impact, rollback plan, and validation steps are drafted"],
+            "expected_tools": ["postgres_sql_classify"],
+            "tool_policy": "read_only_tools",
+        },
+        {
+            "id": "request-approval",
+            "description": "Ask the user to approve the exact change SQL before any execution",
+            "dependencies": ["draft-change-sql"],
+            "status": "pending",
+            "phase": "approve",
+            "operation_type": "schema_change",
+            "risk_level": change_risk,
+            "requires_approval": True,
+            "requires_rollback_plan": True,
+            "evidence_required": [],
+            "success_criteria": ["User reviewed the exact SQL, impact, rollback plan, and validation steps"],
+            "expected_tools": [],
+            "tool_policy": "no_tools",
+        },
+    ]
 
 
 def _top_query_default_steps(evidence: list[str] | None = None) -> list[dict[str, Any]]:
@@ -843,21 +1132,32 @@ def validate_and_normalize_plan(tasks_raw: list[dict[str, Any]], state: AgentSta
     tasks = [_normalize_task(task, idx, intent) for idx, task in enumerate(tasks_raw)]
     _ensure_unique_ids(tasks)
     _fix_dependencies(tasks)
-    goal_text = f"{intent.get('goal') or ''} {intent.get('user_language_summary') or ''}".lower()
-    is_table_listing = bool(
-        re.search(r"\b(tables?|relations?)\b", goal_text, re.IGNORECASE)
-        or any(token in goal_text for token in ("有哪些表", "列出表", "查看表", "表清单", "所有表"))
+    workflow = str(state.get("selected_workflow") or intent.get("suggested_workflow") or "")
+    primary = str(intent.get("primary_intent") or "")
+    task_kind = _intent_task_kind(intent)
+    evidence_set = _intent_evidence(intent)
+    is_table_listing = task_kind == "table_listing"
+    is_slow_sql = _should_force_top_query_path(intent)
+    is_performance_diagnosis = primary == "performance_diagnosis" or workflow == "performance_diagnosis_workflow"
+    is_deep_optimization = is_performance_diagnosis and (
+        task_kind == "deep_optimization_analysis"
+        or ({"execution_plan", "schema_summary", "index_summary"} & evidence_set and _has_read_only_constraint(intent))
     )
-    is_slow_sql = _should_force_top_query_path(intent, goal_text)
+    is_performance_optimization = _is_performance_optimization_request(intent)
+    if is_performance_optimization:
+        tasks = [_normalize_task(task, idx, intent) for idx, task in enumerate(_performance_optimization_default_steps(intent.get("evidence_needed")))]
+        _ensure_unique_ids(tasks)
+        _fix_dependencies(tasks)
     if is_slow_sql:
         tasks = [_normalize_task(task, idx, intent) for idx, task in enumerate(_top_query_default_steps(intent.get("evidence_needed")))]
         _ensure_unique_ids(tasks)
         _fix_dependencies(tasks)
+    if is_deep_optimization:
+        tasks = [_normalize_task(task, idx, intent) for idx, task in enumerate(_deep_optimization_default_steps(intent.get("evidence_needed")))]
+        _ensure_unique_ids(tasks)
+        _fix_dependencies(tasks)
 
-    read_only_constrained = any(
-        "只读" in constraint.lower() or "read-only" in constraint.lower() or "read only" in constraint.lower()
-        for constraint in intent.get("constraints", [])
-    )
+    read_only_constrained = _has_read_only_constraint(intent)
 
     for task in tasks:
         operation = task.get("operation_type", "none")
@@ -975,6 +1275,41 @@ def _format_plan(tasks: list[TaskStep], plan: DBTaskPlan) -> str:
     return "\n".join(lines)
 
 
+def _fast_plan_reason(state: AgentState) -> str | None:
+    """Return a reason to use deterministic planning for common DB workflows.
+
+    Codex and Claude keep the tool protocol deterministic and reserve model
+    calls for reasoning. These PostgreSQL paths are high-frequency, safe to
+    plan from structured state, and benefit directly from lower first-event
+    latency.
+    """
+    intent = state.get("current_intent") or {}
+    if intent.get("domain") != "postgresql":
+        return None
+    workflow = str(state.get("selected_workflow") or intent.get("suggested_workflow") or "")
+    task_kind = _intent_task_kind(intent)
+    evidence_set = _intent_evidence(intent)
+    if task_kind == "target_overview":
+        return "target_overview"
+    if task_kind == "health_check" or ("health_check" in evidence_set and workflow == "read_only_analysis_workflow"):
+        return "health_check"
+    if _is_performance_optimization_request(intent):
+        return "performance_optimization"
+    if _should_force_top_query_path(intent):
+        return "top_query"
+    if task_kind == "deep_optimization_analysis" or (
+        {"execution_plan", "schema_summary", "index_summary"} & evidence_set and _has_read_only_constraint(intent)
+    ):
+        return "deep_optimization"
+    if task_kind == "change_sql_draft" and workflow == "schema_change_workflow":
+        return "change_sql_draft"
+    if task_kind == "readonly_error_probe" or "sql_error" in evidence_set:
+        return "readonly_error_probe"
+    if workflow == "read_only_analysis_workflow" and task_kind == "table_listing":
+        return "table_listing"
+    return None
+
+
 def task_planner(state: AgentState) -> dict[str, Any]:
     """Task planning node — optionally decomposes complex instructions.
 
@@ -1001,6 +1336,31 @@ def task_planner(state: AgentState) -> dict[str, Any]:
 
     user_content = str(user_msg.content) if hasattr(user_msg, "content") else str(user_msg)
     logger.info(f"Task planner analyzing: {user_content[:100]}...")
+
+    fast_reason = _fast_plan_reason(state)
+    if fast_reason:
+        tasks = validate_and_normalize_plan([], state)
+        plan = build_db_task_plan(tasks, state)
+        update = {
+            "plan": _format_plan(tasks, plan),
+            "task_stack": tasks,
+            "db_task_plan": plan,
+            "current_task_index": 0,
+            "plan_review": {
+                "plan_id": plan["id"],
+                "status": "approved" if plan["global_risk_level"] in {"low", "medium"} else "pending",
+                "reviewed_steps": [task["id"] for task in tasks],
+                "user_message": "Deterministic PostgreSQL plan selected from the current task context.",
+            },
+            "planning_strategy": {
+                "type": "deterministic_fast_path",
+                "reason": fast_reason,
+                "model_call_skipped": True,
+            },
+        }
+        if not state.get("model_profiles"):
+            update["model_profiles"] = default_model_profiles()
+        return update
 
     try:
         llm, route, record, profile = create_llm_for_task("planning", state, structured_output_schema="TaskStep[]")

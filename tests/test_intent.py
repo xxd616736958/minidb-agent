@@ -354,6 +354,165 @@ def test_validator_treats_current_database_listing_as_configured_readonly_query(
     assert validated["missing_slots"] == []
 
 
+def test_intent_analyzer_uses_structured_model_intent_for_database_prompts(monkeypatch):
+    structured_outputs = [
+        {
+            "primary_intent": "read_only_analysis",
+            "operation_nature": "read_only",
+            "risk_level": "low",
+            "evidence_needed": ["connection_info", "schema_summary"],
+            "suggested_workflow": "read_only_analysis_workflow",
+            "output_contract": {"task_kind": "target_overview"},
+        },
+        {
+            "primary_intent": "read_only_analysis",
+            "operation_nature": "diagnostic",
+            "risk_level": "low",
+            "evidence_needed": ["connection_info", "health_check", "top_queries"],
+            "suggested_workflow": "read_only_analysis_workflow",
+            "output_contract": {"task_kind": "health_check"},
+        },
+        {
+            "primary_intent": "performance_diagnosis",
+            "operation_nature": "diagnostic",
+            "risk_level": "low",
+            "evidence_needed": ["top_queries", "active_queries", "connection_info"],
+            "suggested_workflow": "performance_diagnosis_workflow",
+            "output_contract": {"task_kind": "optimization_target"},
+        },
+        {
+            "primary_intent": "performance_diagnosis",
+            "operation_nature": "diagnostic",
+            "risk_level": "low",
+            "evidence_needed": ["top_queries", "execution_plan", "schema_summary", "index_summary"],
+            "suggested_workflow": "performance_diagnosis_workflow",
+            "constraints": ["不要执行写操作"],
+            "output_contract": {"task_kind": "deep_optimization_analysis", "read_only_only": True},
+        },
+        {
+            "primary_intent": "schema_change",
+            "operation_nature": "schema_change",
+            "risk_level": "high",
+            "requires_approval": True,
+            "requires_rollback_plan": True,
+            "evidence_needed": ["sql_classification"],
+            "suggested_workflow": "schema_change_workflow",
+            "output_contract": {"task_kind": "change_sql_draft"},
+        },
+        {
+            "primary_intent": "read_only_analysis",
+            "operation_nature": "diagnostic",
+            "risk_level": "low",
+            "evidence_needed": ["sql_error", "schema_summary"],
+            "suggested_workflow": "read_only_analysis_workflow",
+            "output_contract": {"task_kind": "readonly_error_probe"},
+        },
+    ]
+    prompts = [
+        "当前连接的是哪个 PostgreSQL 数据库？请说明环境、数据库名、用户、host、权限模式，并列出当前数据库有哪些 schema 和表。",
+        "帮我检查当前数据库的健康状态，你自己决定需要检查哪些常见指标。",
+        "找出当前数据库最需要优化的一条 SQL，说明你为什么选择它，并给出关键证据。",
+        "基于刚才最需要优化的 SQL，继续分析它的执行计划、相关表结构、索引和统计信息，然后给出优化方案、风险和验证标准。不要执行写操作。",
+        "请为刚才的优化方案生成可以执行的变更 SQL，并说明影响、回滚方案和验证步骤；如果需要执行，先让我审批。",
+        "故意执行一个只读诊断：查询 public.big_orders_demo 的不存在字段 not_exist_column，看看你如何处理错误并继续给出可用结论。",
+    ]
+
+    class FakeLLM:
+        def invoke(self, messages):
+            index = FakeLLM.calls
+            FakeLLM.calls += 1
+            body = {
+                "domain": "postgresql",
+                "candidate_intents": [structured_outputs[index]["primary_intent"]],
+                "confidence": 0.9,
+                "goal": prompts[index],
+                "user_language_summary": prompts[index],
+                "target_environment": "unknown",
+                "target_database": None,
+                "target_objects": [],
+                "input_artifacts": [],
+                "missing_slots": [],
+                "assumptions": [],
+                "constraints": [],
+                "requires_clarification": False,
+                "requires_approval": False,
+                "requires_rollback_plan": False,
+                "next_action": "read_only_observe",
+                **structured_outputs[index],
+            }
+            return AIMessage(content=json.dumps(body, ensure_ascii=False))
+
+    FakeLLM.calls = 0
+    monkeypatch.setattr("agent.nodes.intent.create_llm_no_tools", lambda **_: FakeLLM())
+
+    for prompt, expected in zip(prompts, structured_outputs, strict=True):
+        result = intent_analyzer({"messages": [HumanMessage(content=prompt)], "database_environment": _db_env()})
+        intent = result["current_intent"]
+        assert result["intent_strategy"]["model_call_skipped"] is False
+        assert intent["primary_intent"] == expected["primary_intent"]
+        assert intent["suggested_workflow"] == expected["suggested_workflow"]
+        assert intent["output_contract"]["task_kind"] == expected["output_contract"]["task_kind"]
+        assert intent["requires_clarification"] is False
+        assert intent["target_database"] == "db_agent"
+
+
+def test_intent_analyzer_generalizes_optimization_execution_through_model(monkeypatch):
+    class FakeLLM:
+        def invoke(self, messages):
+            return AIMessage(
+                content=json.dumps(
+                    {
+                        "domain": "postgresql",
+                        "primary_intent": "performance_optimization",
+                        "candidate_intents": ["performance_optimization", "performance_diagnosis", "schema_change"],
+                        "confidence": 0.88,
+                        "goal": "Reduce the cost of the worst query found in the current database.",
+                        "user_language_summary": "User wants the agent to optimize the current database's worst query.",
+                        "operation_nature": "schema_change",
+                        "target_environment": "unknown",
+                        "target_database": None,
+                        "target_objects": [],
+                        "input_artifacts": [],
+                        "output_contract": {"task_kind": "optimization_execution"},
+                        "missing_slots": [],
+                        "assumptions": [],
+                        "constraints": [],
+                        "risk_level": "high",
+                        "requires_clarification": False,
+                        "requires_approval": True,
+                        "requires_rollback_plan": True,
+                        "evidence_needed": [
+                            "top_queries",
+                            "execution_plan",
+                            "schema_summary",
+                            "index_summary",
+                            "row_count_or_statistics",
+                            "sql_classification",
+                        ],
+                        "suggested_workflow": "performance_optimization_workflow",
+                        "next_action": "request_approval",
+                    }
+                )
+            )
+
+    monkeypatch.setattr("agent.nodes.intent.create_llm_no_tools", lambda **_: FakeLLM())
+
+    result = intent_analyzer(
+        {
+            "messages": [HumanMessage(content="请处理当前库里代价最高的查询，能改就改，但危险步骤先问我")],
+            "database_environment": _db_env(),
+        }
+    )
+    intent = result["current_intent"]
+
+    assert intent["primary_intent"] == "performance_optimization"
+    assert intent["output_contract"]["task_kind"] == "optimization_execution"
+    assert intent["requires_approval"] is True
+    assert intent["requires_rollback_plan"] is True
+    assert intent["target_environment"] == "dev"
+    assert intent["target_database"] == "db_agent"
+
+
 def test_validator_clears_pending_clarification_when_model_resolves_context():
     intent = normalize_intent(
         {

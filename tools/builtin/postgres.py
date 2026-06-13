@@ -145,7 +145,11 @@ class PostgresSQLClassifyTool(AgentTool):
                 success=True,
                 result_type="sql_classification",
                 summary=f"SQL classified as {classification.primary_type} with {classification.risk_level} risk.",
-                payload=classification.to_dict(),
+                payload={
+                    **classification.to_dict(),
+                    "sql": sql,
+                    "sql_hash": classification.normalized_sql_hash,
+                },
                 duration_ms=_timed_ms(started),
             )
         )
@@ -251,6 +255,99 @@ class PostgresListSchemasTool(AgentTool):
                     duration_ms=result.duration_ms,
                     truncated=result.truncated,
                     sensitive_fields_masked=result.sensitive_fields_masked,
+                )
+            )
+        except Exception as exc:
+            return _error_result(self.name, "sql_error", exc, _timed_ms(started))
+
+
+class SchemaOverviewInput(BaseModel):
+    include_system: bool = Field(default=False, description="Whether to include system schemas.")
+    table_limit: int = Field(default=500, ge=1, le=1000, description="Maximum user tables to return.")
+
+
+class PostgresSchemaOverviewTool(AgentTool):
+    name: str = "postgres_schema_overview"
+    description: str = "Return current PostgreSQL connection metadata, schemas, and visible tables in one read-only call."
+    args_schema: Type[BaseModel] = SchemaOverviewInput
+    tool_domain: str = "postgresql"
+    operation_type: str = "read_only"
+    risk_level: str = "low"
+    read_only: bool = True
+    destructive: bool = False
+    allowed_phases: list[str] = ["observe", "diagnose", "verify", "report"]
+    allowed_policies: list[str] = ["read_only_tools", "write_tools_after_approval"]
+    output_type: str = "schema_summary"
+    result_sensitivity: str = "internal"
+    search_hint: str | None = "overview PostgreSQL current database schemas tables connection"
+
+    def _run(self, include_system: bool = False, table_limit: int = 500) -> str:
+        started = time.monotonic()
+        schema_filter = "%s OR (NOT starts_with(schema_name, 'pg_') AND schema_name <> 'information_schema')"
+        table_filter = "%s OR (NOT starts_with(t.table_schema, 'pg_') AND t.table_schema <> 'information_schema')"
+        try:
+            drv = _driver()
+            connection = drv.execute(
+                "SELECT current_database() AS database, current_user AS user, inet_server_addr()::text AS host, inet_server_port() AS port, version() AS version",
+                readonly=True,
+                max_rows=1,
+            )
+            schemas = drv.execute(
+                f"""
+                SELECT schema_name,
+                       schema_owner,
+                       CASE
+                           WHEN starts_with(schema_name, 'pg_') THEN 'system'
+                           WHEN schema_name = 'information_schema' THEN 'system'
+                           ELSE 'user'
+                       END AS schema_type
+                FROM information_schema.schemata
+                WHERE {schema_filter}
+                ORDER BY schema_type, schema_name
+                """,
+                params=[include_system],
+                readonly=True,
+                max_rows=300,
+            )
+            tables = drv.execute(
+                f"""
+                SELECT t.table_schema AS schema,
+                       t.table_name AS name,
+                       t.table_type AS type
+                FROM information_schema.tables t
+                WHERE {table_filter}
+                  AND t.table_type IN ('BASE TABLE', 'VIEW')
+                ORDER BY t.table_schema, t.table_name
+                LIMIT %s
+                """,
+                params=[include_system, table_limit],
+                readonly=True,
+                max_rows=table_limit,
+            )
+            payload = {
+                "connection": connection.rows[0] if connection.rows else {},
+                "schemas": schemas.rows,
+                "tables": tables.rows,
+                "include_system": include_system,
+            }
+            safe_payload, payload_truncated, payload_masked = limit_payload(payload)
+            duration = connection.duration_ms + schemas.duration_ms + tables.duration_ms
+            return dumps_result(
+                make_result(
+                    tool_name=self.name,
+                    success=True,
+                    result_type="schema_summary",
+                    summary=f"Collected target overview: {schemas.row_count} schema(s), {tables.row_count} table/view object(s).",
+                    payload=safe_payload,
+                    row_count=(schemas.row_count or 0) + (tables.row_count or 0),
+                    duration_ms=duration or _timed_ms(started),
+                    truncated=connection.truncated or schemas.truncated or tables.truncated or payload_truncated,
+                    sensitive_fields_masked=[
+                        *connection.sensitive_fields_masked,
+                        *schemas.sensitive_fields_masked,
+                        *tables.sensitive_fields_masked,
+                        *payload_masked,
+                    ],
                 )
             )
         except Exception as exc:
@@ -899,7 +996,7 @@ class PostgresIndexAdvisorTool(AgentTool):
     risk_level: str = "medium"
     read_only: bool = True
     destructive: bool = False
-    allowed_phases: list[str] = ["diagnose", "propose", "verify"]
+    allowed_phases: list[str] = ["observe", "diagnose", "propose", "verify"]
     allowed_policies: list[str] = ["read_only_tools", "write_tools_after_approval"]
     output_type: str = "index_advice"
     result_sensitivity: str = "internal"
@@ -1199,7 +1296,16 @@ class PostgresExecuteWriteTool(AgentTool):
                 )
             )
         try:
-            result = _driver().execute(sql, readonly=False, max_rows=100)
+            requires_autocommit = bool(
+                re.search(r"\bcreate\s+index\s+concurrently\b", sql, re.IGNORECASE)
+            )
+            result = _driver().execute(
+                sql,
+                readonly=False,
+                max_rows=100,
+                autocommit=requires_autocommit,
+                statement_timeout_ms=120_000 if requires_autocommit else None,
+            )
             return dumps_result(
                 make_result(
                     tool_name=self.name,

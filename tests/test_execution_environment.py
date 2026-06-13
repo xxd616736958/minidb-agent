@@ -90,6 +90,31 @@ def test_execution_environment_bootstrap_creates_task_workspace(tmp_path, monkey
     assert os.path.isdir(update["task_workspace"]["root_path"])
 
 
+def test_execution_environment_creates_new_workspace_when_plan_changes(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    first = {
+        "id": "plan-old",
+        "intent_id": "intent-old",
+        "workflow": "test",
+        "summary": "old",
+        "status": "completed",
+        "steps": [],
+        "assumptions": [],
+        "constraints": [],
+        "global_risk_level": "low",
+        "requires_user_confirmation": False,
+        "created_at": "now",
+        "updated_at": "now",
+    }
+    old_workspace = ExecutionEnvironmentManager({"db_task_plan": first}).bootstrap_state()["task_workspace"]
+    second = {**first, "id": "plan-new", "summary": "new"}
+
+    update = ExecutionEnvironmentManager({"db_task_plan": second, "task_workspace": old_workspace}).bootstrap_state()
+
+    assert update["task_workspace"]["plan_id"] == "plan-new"
+    assert update["task_workspace"]["root_path"] != old_workspace["root_path"]
+
+
 def test_database_environment_profile_is_safe_and_production_aware(monkeypatch):
     monkeypatch.setenv("POSTGRES_TARGET_ENV", "production")
     profile = build_database_environment_profile("postgresql://user:secret@prod.example.com:5432/app")

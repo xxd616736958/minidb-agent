@@ -22,6 +22,7 @@ from tools.builtin.postgres import (
     PostgresListSchemasTool,
     PostgresObjectDetailTool,
     PostgresQueryReadonlyTool,
+    PostgresSchemaOverviewTool,
     PostgresSQLClassifyTool,
     PostgresTopQueriesTool,
 )
@@ -135,12 +136,17 @@ def test_postgres_tools_are_discovered_with_metadata():
     assert db_spec is not None
     assert db_spec["capability"]["read_only"] is True
 
+    overview_spec = registry.get_spec("postgres_schema_overview")
+    assert overview_spec is not None
+    assert overview_spec["capability"]["read_only"] is True
+
 
 def test_expected_postgres_read_alias_exposes_new_read_tools():
     registry = SkillRegistry()
     registry.register(PostgresQueryReadonlyTool())
     registry.register(PostgresListDatabasesTool())
     registry.register(PostgresExplainTool())
+    registry.register(PostgresSchemaOverviewTool())
     registry.register(PostgresDryRunTool())
 
     tools, specs = registry.get_for_state(_state())
@@ -149,8 +155,60 @@ def test_expected_postgres_read_alias_exposes_new_read_tools():
     assert "postgres_query_readonly" in names
     assert "postgres_list_databases" in names
     assert "postgres_explain" in names
+    assert "postgres_schema_overview" in names
     assert "postgres_dry_run" not in names
     assert all(spec["capability"]["read_only"] for spec in specs)
+
+
+def test_schema_overview_returns_connection_schemas_and_tables_without_percent_placeholder(monkeypatch):
+    captured_sql: list[str] = []
+
+    class FakeDriver:
+        def execute(self, sql, *, params=None, readonly=False, max_rows=100, **kwargs):
+            captured_sql.append(sql)
+            assert readonly is True
+            if "current_database()" in sql:
+                return QueryResult(
+                    rows=[{"database": "db_agent", "user": "db_agent", "host": "127.0.0.1", "port": 5432}],
+                    row_count=1,
+                    affected_rows=None,
+                    sqlstate=None,
+                    duration_ms=1,
+                    truncated=False,
+                    sensitive_fields_masked=[],
+                )
+            if "information_schema.schemata" in sql:
+                return QueryResult(
+                    rows=[{"schema_name": "public", "schema_owner": "db_agent", "schema_type": "user"}],
+                    row_count=1,
+                    affected_rows=None,
+                    sqlstate=None,
+                    duration_ms=1,
+                    truncated=False,
+                    sensitive_fields_masked=[],
+                )
+            assert "information_schema.tables" in sql
+            return QueryResult(
+                rows=[{"schema": "public", "name": "big_orders_demo", "type": "BASE TABLE"}],
+                row_count=1,
+                affected_rows=None,
+                sqlstate=None,
+                duration_ms=1,
+                truncated=False,
+                sensitive_fields_masked=[],
+            )
+
+    monkeypatch.setattr("tools.builtin.postgres._driver", lambda: FakeDriver())
+
+    output = PostgresSchemaOverviewTool()._run(include_system=False, table_limit=10)
+    result = loads_result(output)
+
+    assert result is not None
+    assert result["success"] is True
+    assert result["payload"]["connection"]["database"] == "db_agent"
+    assert result["payload"]["schemas"][0]["schema_name"] == "public"
+    assert result["payload"]["tables"][0]["name"] == "big_orders_demo"
+    assert not any("LIKE 'pg_%" in sql for sql in captured_sql)
 
 
 def test_write_tools_are_visible_before_approval_so_policy_gate_can_prompt():
@@ -480,6 +538,50 @@ def test_create_index_concurrently_tool_uses_autocommit(monkeypatch):
     assert result is not None
     assert result["success"] is True
     assert "CREATE INDEX CONCURRENTLY" in captured["sql"]
+    assert captured["autocommit"] is True
+    assert captured["readonly"] is False
+    assert captured["statement_timeout_ms"] == 120_000
+
+
+def test_execute_write_tool_uses_autocommit_for_create_index_concurrently(monkeypatch):
+    captured = {}
+    sql = "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_orders_status ON public.orders (status)"
+
+    class FakeDriver:
+        def execute(self, sql_text, *, autocommit=False, readonly=False, max_rows=100, statement_timeout_ms=None, **kwargs):
+            captured.update(
+                {
+                    "sql": sql_text,
+                    "autocommit": autocommit,
+                    "readonly": readonly,
+                    "statement_timeout_ms": statement_timeout_ms,
+                }
+            )
+            return QueryResult(
+                rows=[],
+                row_count=0,
+                affected_rows=None,
+                sqlstate=None,
+                duration_ms=1,
+                truncated=False,
+                sensitive_fields_masked=[],
+            )
+
+    monkeypatch.setattr("tools.builtin.postgres._driver", lambda: FakeDriver())
+    monkeypatch.setenv("POSTGRES_TARGET_ENV", "dev")
+
+    output = PostgresExecuteWriteTool()._run(
+        sql,
+        approval_id="approval-1",
+        approved_sql_hash=classify_sql(sql, allow_explain_analyze=True).normalized_sql_hash,
+        target_environment="dev",
+        impact_summary="Create index.",
+        rollback_summary="Drop index.",
+    )
+    result = loads_result(output)
+
+    assert result is not None
+    assert result["success"] is True
     assert captured["autocommit"] is True
     assert captured["readonly"] is False
     assert captured["statement_timeout_ms"] == 120_000

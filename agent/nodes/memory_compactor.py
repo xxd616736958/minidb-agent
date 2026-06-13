@@ -71,6 +71,15 @@ def memory_compactor(state: AgentState) -> dict[str, Any]:
     """
     settings = get_settings()
     messages = list(state.get("messages", []))
+    current_step_id = state.get("current_step_id")
+    if current_step_id and state.get("loop_status") == "running":
+        steps = state.get("task_stack") or []
+        current_step = next((step for step in steps if step.get("id") == current_step_id), None)
+        if current_step and current_step.get("status") == "running":
+            # Codex/Claude-style tool turns should stay protocol-stable until
+            # the current step is verified; compacting mid tool loop can reorder
+            # recent assistant/tool messages and cause repeated tool execution.
+            return {}
 
     if len(messages) < KEEP_RECENT_COUNT + 4:
         # Not enough messages to warrant compaction

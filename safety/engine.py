@@ -87,6 +87,40 @@ def _sql_from_args(args: Any) -> str | None:
     return None
 
 
+def _quote_ident(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", text):
+        raise ValueError(f"Unsafe PostgreSQL identifier: {text!r}")
+    return text
+
+
+def _quote_qualified_name(value: Any) -> str:
+    text = str(value or "").strip()
+    parts = text.split(".")
+    if not parts or len(parts) > 2:
+        raise ValueError(f"Unsafe PostgreSQL qualified name: {text!r}")
+    return ".".join(_quote_ident(part) for part in parts)
+
+
+def _project_sql_from_tool_call(tool_name: str, args: Any) -> str | None:
+    """Return auditable SQL for parameterized PostgreSQL write tools."""
+    if not isinstance(args, dict):
+        return None
+    if tool_name == "postgres_create_index_concurrently":
+        table = _quote_qualified_name(args.get("table_name"))
+        columns = args.get("columns") or []
+        if not isinstance(columns, list) or not columns:
+            return None
+        column_sql = ", ".join(_quote_ident(column) for column in columns)
+        using = str(args.get("using") or "btree").lower()
+        if using not in {"btree", "hash", "gist", "gin", "brin", "spgist"}:
+            return None
+        index_name = args.get("index_name")
+        index_sql = f"IF NOT EXISTS {_quote_ident(index_name)} " if index_name else ""
+        return f"CREATE INDEX CONCURRENTLY {index_sql}ON {table} USING {using} ({column_sql});"
+    return None
+
+
 def _current_step(state: AgentState) -> TaskStep | None:
     steps = list(state.get("task_stack", []))
     step_id = state.get("current_step_id")
@@ -363,10 +397,12 @@ class SecurityPolicyEngine:
         db_env = self.state.get("database_environment") or {}
         target_environment = str(db_env.get("environment_name") or "unknown")
         target_database = db_env.get("target_database")
+        allowed_step_ids = {str(step.get("id") or "")}
+        allowed_step_ids.update(str(item) for item in step.get("dependencies", []) if item)
         for approval in reversed(self.state.get("approval_decisions", [])):
             if approval.get("status") != "approved":
                 continue
-            if approval.get("step_id") != step.get("id"):
+            if str(approval.get("step_id") or "") not in allowed_step_ids:
                 continue
             if approval.get("target_environment") not in {target_environment, "unknown", None}:
                 continue
@@ -464,9 +500,18 @@ class SecurityPolicyEngine:
         args = tool_call.get("args") or {}
         step, policy = self._current_step_and_policy()
         risk = str((spec or {}).get("capability", {}).get("risk_level", (step or {}).get("risk_level", "low")))
-        sql = _sql_from_args(args)
+        sql = _sql_from_args(args) or _project_sql_from_tool_call(tool_name, args)
         sql_report = build_sql_safety_report(sql, allow_explain_analyze=True) if sql else None
         if sql_report:
+            sql_report.update(
+                {
+                    "call_id": call_id,
+                    "tool_call_id": call_id,
+                    "tool_name": tool_name,
+                    "step_id": (step or {}).get("id"),
+                    "source": "tool_policy_gate",
+                }
+            )
             risk = _risk_max(risk, sql_report["risk_level"])
 
         if policy == "no_tools":
@@ -721,7 +766,12 @@ class SecurityPolicyEngine:
             "maintenance",
             "transaction_control",
         }
-        if capability.get("domain") == "postgresql" and capability.get("read_only") and is_mutating:
+        if (
+            capability.get("domain") == "postgresql"
+            and capability.get("read_only")
+            and is_mutating
+            and tool_name not in POSTGRES_DIAGNOSTIC_TOOLS_ALLOW_WRITE_SQL_INPUT
+        ):
             return self._decision(
                 scope="sql_execution",
                 subject=tool_name,

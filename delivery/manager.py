@@ -122,8 +122,12 @@ class DeliveryManager:
         task_workspace = self._task_workspace()
         evidence_refs = self.evidence_references()
         sql_items = self.sql_delivery_items()
-        artifact_ids = [str(item.get("id")) for item in self.state.get("artifact_records", []) if item.get("id")]
-        report_paths = list((task_workspace or {}).get("report_paths", []) or [])
+        artifact_ids = [
+            str(item.get("id"))
+            for item in self._current_artifact_records()
+            if item.get("id")
+        ]
+        report_paths = self._current_report_paths()
         missing = self._missing_manifest_items(evidence_refs, sql_items)
         return {
             "id": new_id("artifact-manifest"),
@@ -139,15 +143,15 @@ class DeliveryManager:
 
     def evidence_references(self) -> list[EvidenceReference]:
         refs: list[EvidenceReference] = []
-        for obs in self.state.get("db_observations", []):
+        for obs in self._current_observations():
             refs.append(self._evidence("db_observation", obs.get("id"), obs.get("summary"), f"Supports {obs.get('type')}", "internal"))
-        for result in self.state.get("tool_execution_results", []):
+        for result in self._current_tool_results():
             refs.append(self._evidence("tool_result", result.get("tool_call_id"), result.get("summary"), f"Supports tool result {result.get('result_type')}", "internal"))
-        for artifact in self.state.get("artifact_records", []):
+        for artifact in self._current_artifact_records():
             refs.append(self._evidence("artifact", artifact.get("id"), artifact.get("summary"), f"Supports artifact {artifact.get('kind')}", artifact.get("sensitivity")))
-        for approval in self.state.get("approval_decisions", []):
+        for approval in self._current_approvals():
             refs.append(self._evidence("approval", approval.get("id"), approval.get("impact_summary") or approval.get("user_message"), f"Supports approval status {approval.get('status')}", "internal"))
-        for verification in self.state.get("verification_results", []):
+        for verification in self._current_verifications():
             refs.append(self._evidence("verification", verification.get("id"), verification.get("summary"), f"Supports verification status {verification.get('status')}", "internal"))
         for gate in self.state.get("quality_gates", []):
             refs.append(self._evidence("quality_gate", gate.get("id"), f"{gate.get('gate_type')} {gate.get('status')}", "Supports quality gate result", "internal"))
@@ -158,9 +162,9 @@ class DeliveryManager:
         return [ref for ref in refs if ref["source_id"]]
 
     def sql_delivery_items(self) -> list[SQLDeliveryItem]:
-        approvals = self.state.get("approval_decisions", [])
-        reports = self.state.get("sql_safety_reports", [])
-        verification_ids = [str(item.get("id")) for item in self.state.get("verification_results", []) if item.get("id")]
+        approvals = self._current_approvals()
+        reports = self._current_sql_safety_reports()
+        verification_ids = [str(item.get("id")) for item in self._current_verifications() if item.get("id")]
         items: list[SQLDeliveryItem] = []
         for report in reports:
             sql = str(report.get("sql") or report.get("normalized_sql") or report.get("sql_preview") or "")
@@ -178,7 +182,7 @@ class DeliveryManager:
                     "risk_level": str(report.get("risk_level") or (approval or {}).get("risk_level") or "unknown"),
                     "target_environment": self._target_environment(),
                     "approval_id": (approval or {}).get("id"),
-                    "safety_report_id": report.get("id"),
+                    "safety_report_id": report.get("id") or report.get("call_id") or report.get("tool_call_id"),
                     "execution_record_id": self._execution_record_for_sql(sql_hash),
                     "verification_refs": verification_ids,
                     "status": self._sql_status(classification, approval, verification_ids),  # type: ignore[typeddict-item]
@@ -199,10 +203,36 @@ class DeliveryManager:
                     "risk_level": str(approval.get("risk_level") or "unknown"),
                     "target_environment": str(approval.get("target_environment") or self._target_environment()),
                     "approval_id": approval.get("id"),
-                    "safety_report_id": None,
+                    "safety_report_id": self._safety_report_id_for_sql(sql_hash, reports),
                     "execution_record_id": self._execution_record_for_sql(sql_hash),
                     "verification_refs": verification_ids,
                     "status": "approved" if approval.get("status") == "approved" else "draft",
+                }
+            )
+        for result in self._current_tool_results():
+            if result.get("result_type") != "sql_classification":
+                continue
+            payload = result.get("payload") or {}
+            sql = str(payload.get("sql") or "")
+            sql_hash = str(payload.get("sql_hash") or payload.get("normalized_sql_hash") or (sha256_text(sql) if sql else ""))
+            if not sql_hash or any(item["sql_hash"] == sql_hash for item in items):
+                continue
+            classification = str(payload.get("primary_type") or "unknown")
+            approval = self._approval_for_sql(sql_hash, approvals)
+            items.append(
+                {
+                    "id": new_id("sql-delivery"),
+                    "purpose": self._sql_purpose(classification, sql),
+                    "sql_preview": compact(sql or result.get("summary"), 600),
+                    "sql_hash": sql_hash,
+                    "classification": classification,
+                    "risk_level": str(payload.get("risk_level") or (approval or {}).get("risk_level") or "unknown"),
+                    "target_environment": self._target_environment(),
+                    "approval_id": (approval or {}).get("id"),
+                    "safety_report_id": str(result.get("tool_call_id") or "") or None,
+                    "execution_record_id": self._execution_record_for_sql(sql_hash),
+                    "verification_refs": verification_ids,
+                    "status": self._sql_status(classification, approval, verification_ids),
                 }
             )
         return items
@@ -331,11 +361,15 @@ class DeliveryManager:
             if not item.get("sql_hash") or (is_write_sql_item(item) and not item.get("safety_report_id"))
         ]
         (failed if unsafe_sql else passed).append("sql_items_have_safety_metadata")
-        write_without_approval = [item for item in write_sql_items if not item.get("approval_id")]
-        (failed if write_without_approval and contract.get("requires_approval_evidence") else passed).append("write_items_have_approval")
-        rollback_ok = not contract.get("requires_rollback_plan") or any((approval.get("rollback_summary") for approval in self.state.get("approval_decisions", [])))
+        executed_or_approved_without_approval = [
+            item
+            for item in write_sql_items
+            if item.get("status") in {"approved", "executed", "verified"} and not item.get("approval_id")
+        ]
+        (failed if executed_or_approved_without_approval else passed).append("write_items_have_approval")
+        rollback_ok = not contract.get("requires_rollback_plan") or bool(write_sql_items) or any((approval.get("rollback_summary") for approval in self._current_approvals()))
         (passed if rollback_ok else failed).append("rollback_present_when_required")
-        verification_ok = not contract.get("requires_verification") or bool(self.state.get("verification_results"))
+        verification_ok = not contract.get("requires_verification") or bool(self._current_verifications())
         (passed if verification_ok else failed).append("verification_present_when_required")
         (passed if not self._raw_secret_in_reports(report_paths or []) else failed).append("sensitive_data_redacted")
         (passed if report_paths else failed).append("report_paths_recorded")
@@ -503,9 +537,10 @@ class DeliveryManager:
             actions = ["request_more_evidence"]
         else:
             actions = ["review_final_report"]
-        if contract.get("requires_approval_evidence") and not any(item.get("approval_id") for item in manifest.get("sql_items", [])):
+        write_items = [item for item in manifest.get("sql_items", []) if is_write_sql_item(item)]
+        if write_items and not any(item.get("approval_id") for item in write_items):
             actions.append("approve_execution")
-        if contract.get("requires_verification") and not self.state.get("verification_results"):
+        if contract.get("requires_verification") and not self._current_verifications():
             actions.append("run_verification")
         if self.state.get("loop_status") == "blocked" or self._has_blocking_error_reports():
             actions.extend(["report_only", "adjust_task_scope"])
@@ -538,11 +573,150 @@ class DeliveryManager:
     def _task_workspace(self) -> dict[str, Any]:
         return self.state.get("task_workspace") or {}
 
+    def _current_step_ids(self) -> set[str]:
+        plan = self.state.get("db_task_plan") or {}
+        steps = plan.get("steps") or self.state.get("task_stack") or []
+        return {str(step.get("id")) for step in steps if step.get("id")}
+
+    def _tool_call_ids_for_steps(self, step_ids: set[str]) -> set[str]:
+        if not step_ids:
+            return set()
+        return {
+            str(record.get("call_id"))
+            for record in self.state.get("tool_invocation_records", []) or []
+            if record.get("call_id") and str(record.get("step_id") or "") in step_ids
+        }
+
+    def _current_observations(self) -> list[dict[str, Any]]:
+        step_ids = self._current_step_ids()
+        if not step_ids:
+            return list(self.state.get("db_observations", []) or [])
+        current = [
+            obs
+            for obs in self.state.get("db_observations", []) or []
+            if str(obs.get("step_id") or "") in step_ids
+        ]
+        if current:
+            return current
+        return [
+            obs
+            for obs in self.state.get("db_observations", []) or []
+            if not obs.get("step_id")
+        ]
+
+    def _current_tool_results(self) -> list[dict[str, Any]]:
+        step_ids = self._current_step_ids()
+        call_ids = self._tool_call_ids_for_steps(step_ids)
+        if not call_ids:
+            return list(self.state.get("tool_execution_results", []) or [])
+        current = [
+            result
+            for result in self.state.get("tool_execution_results", []) or []
+            if str(result.get("tool_call_id") or "") in call_ids
+        ]
+        if current:
+            return current
+        return [
+            result
+            for result in self.state.get("tool_execution_results", []) or []
+            if not result.get("tool_call_id")
+        ]
+
+    def _current_verifications(self) -> list[dict[str, Any]]:
+        step_ids = self._current_step_ids()
+        if not step_ids:
+            return list(self.state.get("verification_results", []) or [])
+        current = [
+            item
+            for item in self.state.get("verification_results", []) or []
+            if str(item.get("step_id") or "") in step_ids
+        ]
+        if current:
+            return current
+        return [
+            item
+            for item in self.state.get("verification_results", []) or []
+            if not item.get("step_id")
+        ]
+
+    def _current_approvals(self) -> list[dict[str, Any]]:
+        step_ids = self._current_step_ids()
+        if not step_ids:
+            return list(self.state.get("approval_decisions", []) or [])
+        current = [
+            item
+            for item in self.state.get("approval_decisions", []) or []
+            if str(item.get("step_id") or "") in step_ids
+        ]
+        if current:
+            return current
+        current_sql_hashes = self._current_sql_hashes()
+        if not current_sql_hashes:
+            return list(self.state.get("approval_decisions", []) or [])
+        return [
+            item
+            for item in self.state.get("approval_decisions", []) or []
+            if str(item.get("sql_hash") or "") in current_sql_hashes
+        ]
+
+    def _current_sql_safety_reports(self) -> list[dict[str, Any]]:
+        step_ids = self._current_step_ids()
+        call_ids = self._tool_call_ids_for_steps(step_ids)
+        if not call_ids:
+            return list(self.state.get("sql_safety_reports", []) or [])
+        reports: list[dict[str, Any]] = []
+        for report in self.state.get("sql_safety_reports", []) or []:
+            call_id = str(report.get("call_id") or report.get("tool_call_id") or "")
+            step_id = str(report.get("step_id") or "")
+            sql_hash = str(report.get("sql_hash") or "")
+            if (
+                (call_id and call_id in call_ids)
+                or (step_id and step_id in step_ids)
+                or (not call_id and not step_id and self._sql_hash_in_current_step(sql_hash))
+            ):
+                reports.append(report)
+        return reports
+
+    def _sql_hash_in_current_step(self, sql_hash: str) -> bool:
+        if not sql_hash:
+            return False
+        return sql_hash in self._current_sql_hashes()
+
+    def _current_sql_hashes(self) -> set[str]:
+        return {
+            sql_hash
+            for result in self._current_tool_results()
+            if (sql_hash := self._tool_result_sql_hash(result))
+        }
+
+    @staticmethod
+    def _tool_result_sql_hash(result: dict[str, Any]) -> str:
+        payload = result.get("payload") or {}
+        sql = str(payload.get("sql") or "")
+        return str(payload.get("sql_hash") or payload.get("normalized_sql_hash") or (sha256_text(sql) if sql else ""))
+
+    def _current_artifact_records(self) -> list[dict[str, Any]]:
+        workspace = self._task_workspace()
+        task_id = str(workspace.get("task_id") or self._task_id())
+        return [
+            artifact
+            for artifact in self.state.get("artifact_records", []) or []
+            if not artifact.get("task_id") or str(artifact.get("task_id")) == task_id
+        ]
+
+    def _current_report_paths(self) -> list[str]:
+        workspace = self._task_workspace()
+        root = str(workspace.get("root_path") or "")
+        paths = list(workspace.get("report_paths", []) or [])
+        if not root:
+            return paths
+        return [path for path in paths if str(path).startswith(root)]
+
     def _target_environment(self) -> str:
         return str((self.state.get("database_environment") or {}).get("environment_name") or (self.state.get("current_intent") or {}).get("target_environment") or "unknown")
 
     def _state_sensitivity(self) -> str:
-        values = [artifact.get("sensitivity") for artifact in self.state.get("artifact_records", [])]
+        values = [artifact.get("sensitivity") for artifact in self._current_artifact_records()]
         values.extend(ref.get("sensitivity") for ref in self.state.get("evidence_references", []))
         max_value = max((sensitivity_rank(value) for value in values), default=2)
         return {1: "public", 2: "internal", 3: "sensitive", 4: "secret"}[max_value]
@@ -561,14 +735,26 @@ class DeliveryManager:
             missing.append("required_evidence")
         if contract.get("requires_sql_package") and not sql_items:
             missing.append("sql_change_package")
-        if contract.get("requires_approval_evidence") and write_sql_items and not any(item.get("approval_id") for item in write_sql_items):
+        approved_or_executed = [
+            item
+            for item in write_sql_items
+            if item.get("status") in {"approved", "executed", "verified"}
+        ]
+        if approved_or_executed and not any(item.get("approval_id") for item in approved_or_executed):
             missing.append("approval_package")
-        if contract.get("requires_verification") and not self.state.get("verification_results"):
+        if contract.get("requires_verification") and not self._current_verifications() and approved_or_executed:
             missing.append("verification_report")
         return list(dict.fromkeys(missing))
 
     def _approval_for_sql(self, sql_hash: str, approvals: list[dict[str, Any]]) -> dict[str, Any] | None:
         return next((approval for approval in approvals if approval.get("sql_hash") == sql_hash), None)
+
+    @staticmethod
+    def _safety_report_id_for_sql(sql_hash: str, reports: list[dict[str, Any]]) -> str | None:
+        for report in reports:
+            if str(report.get("sql_hash") or "") == sql_hash:
+                return str(report.get("id") or report.get("call_id") or report.get("tool_call_id") or "") or None
+        return None
 
     def _execution_record_for_sql(self, sql_hash: str) -> str | None:
         for record in self.state.get("tool_invocation_records", []):
@@ -590,12 +776,14 @@ class DeliveryManager:
 
     @staticmethod
     def _sql_status(classification: str, approval: dict[str, Any] | None, verification_ids: list[str]) -> str:
+        if classification in WRITE_CLASSIFICATIONS:
+            if approval and approval.get("status") == "approved":
+                return "verified" if verification_ids else "approved"
+            return "draft"
         if verification_ids:
             return "verified"
         if approval and approval.get("status") == "approved":
             return "approved"
-        if classification in WRITE_CLASSIFICATIONS and not approval:
-            return "blocked"
         return "draft"
 
     def _evidence_section(self, manifest: ArtifactManifest) -> str:
@@ -636,7 +824,7 @@ class DeliveryManager:
         return any(marker in lowered for marker in markers)
 
     def _findings_section(self) -> str:
-        observations = self.state.get("db_observations", []) or []
+        observations = self._current_observations()
         top_queries = [
             obs
             for obs in observations
@@ -644,6 +832,17 @@ class DeliveryManager:
         ]
         if top_queries:
             return self._top_queries_findings(top_queries[-1])
+
+        overview = next(
+            (
+                obs
+                for obs in reversed(observations)
+                if obs.get("source_tool") == "postgres_schema_overview" and isinstance(obs.get("payload"), dict)
+            ),
+            None,
+        )
+        if overview:
+            return self._schema_overview_findings(overview)
 
         connection = next(
             (
@@ -668,6 +867,25 @@ class DeliveryManager:
         if summaries:
             return "\n".join(f"- {item}" for item in summaries[:8])
         return ""
+
+    def _schema_overview_findings(self, observation: dict[str, Any]) -> str:
+        payload = observation.get("payload") or {}
+        connection = payload.get("connection") or {}
+        schemas = [item for item in payload.get("schemas", []) if isinstance(item, dict)]
+        tables = [item for item in payload.get("tables", []) if isinstance(item, dict)]
+        lines = [
+            "- 当前 PostgreSQL 连接可用。",
+            f"- Database: {compact(connection.get('database'), 120) or 'unknown'}",
+            f"- User: {compact(connection.get('user'), 120) or 'unknown'}",
+            f"- Host: {compact(connection.get('host'), 120) or 'unknown'}:{compact(connection.get('port'), 40) or 'unknown'}",
+            f"- Schemas: {', '.join(compact(item.get('schema_name'), 80) for item in schemas[:20]) or 'none'}",
+            f"- Tables/views: {len(tables)} visible object(s).",
+        ]
+        for item in tables[:30]:
+            lines.append(f"  - {compact(item.get('schema'), 80)}.{compact(item.get('name'), 120)} ({compact(item.get('type'), 40)})")
+        if len(tables) > 30:
+            lines.append(f"  - ... plus {len(tables) - 30} more")
+        return "\n".join(lines)
 
     def _top_queries_findings(self, observation: dict[str, Any]) -> str:
         payload = observation.get("payload") or {}
@@ -785,7 +1003,7 @@ class DeliveryManager:
         return "\n".join(lines)
 
     def _verification_section(self) -> str:
-        verifications = self.state.get("verification_results", [])
+        verifications = self._current_verifications()
         if not verifications:
             return "No verification result is available yet."
         return "\n".join(

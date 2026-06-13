@@ -194,6 +194,153 @@ def test_verify_step_marks_running_step_completed():
     assert result["verification_results"][0]["status"] == "passed"
 
 
+def test_verify_step_completes_health_check_with_structured_health_report():
+    steps = [
+        _step(
+            "check-database-health",
+            status="running",
+            expected_tools=[
+                "postgres_connection_check",
+                "postgres_health_check",
+                "postgres_lock_inspect",
+                "postgres_top_queries",
+            ],
+            evidence_required=["health_check", "connection_info"],
+        )
+    ]
+    observations = [
+        {
+            "id": "obs-connection",
+            "step_id": "check-database-health",
+            "type": "connection_status",
+            "source_tool": "postgres_connection_check",
+            "summary": "PostgreSQL connection is available.",
+            "payload": {"success": True},
+            "created_at": "now",
+        },
+        {
+            "id": "obs-health",
+            "step_id": "check-database-health",
+            "type": "health_report",
+            "source_tool": "postgres_health_check",
+            "summary": "Health check completed.",
+            "payload": {"success": True, "checks": {"table": {"row_count": 1}}},
+            "created_at": "now",
+        },
+        {
+            "id": "obs-top",
+            "step_id": "check-database-health",
+            "type": "top_queries",
+            "source_tool": "postgres_top_queries",
+            "summary": "Collected top queries.",
+            "payload": {"success": True, "queries": []},
+            "created_at": "now",
+        },
+    ]
+
+    result = verify_step(
+        _state(
+            steps,
+            current_step_id="check-database-health",
+            db_observations=observations,
+        )
+    )
+
+    assert result["task_stack"][0]["status"] == "completed"
+    assert result["verification_results"][0]["status"] == "passed"
+
+
+def test_verify_step_completes_when_all_expected_readonly_tools_returned():
+    steps = [
+        _step(
+            "collect-optimization-evidence",
+            status="running",
+            expected_tools=[
+                "postgres_top_queries",
+                "postgres_explain",
+                "postgres_object_detail",
+                "postgres_query_readonly",
+                "postgres_index_advisor",
+            ],
+            evidence_required=[
+                "top_queries",
+                "execution_plan",
+                "schema_summary",
+                "index_summary",
+                "row_count_or_statistics",
+                "legacy_label_that_has_no_alias",
+            ],
+            success_criteria=["Evidence collected"],
+        )
+    ]
+    observations = [
+        {
+            "id": f"obs-{tool}",
+            "step_id": "collect-optimization-evidence",
+            "type": obs_type,
+            "source_tool": tool,
+            "summary": f"{tool} ok",
+            "payload": payload,
+            "created_at": "now",
+        }
+        for tool, obs_type, payload in [
+            ("postgres_top_queries", "top_queries", {"success": True, "queries": [{"query_preview": "SELECT 1"}]}),
+            ("postgres_explain", "explain_plan", {"success": True, "plan": {"root_node_type": "Seq Scan"}}),
+            ("postgres_object_detail", "object_detail", {"success": True, "columns": [{"column_name": "id"}]}),
+            ("postgres_query_readonly", "query_result", {"success": True, "rows": [{"n_live_tup": 1}]}),
+            ("postgres_index_advisor", "index_advice", {"success": True, "advice": []}),
+        ]
+    ]
+
+    result = verify_step(
+        _state(
+            steps,
+            current_step_id="collect-optimization-evidence",
+            db_observations=observations,
+        )
+    )
+
+    assert result["task_stack"][0]["status"] == "completed"
+    assert result["verification_results"][0]["status"] == "passed"
+    assert "All planned read-only tools returned successfully" in result["verification_results"][0]["summary"]
+
+
+def test_verify_step_completes_sql_classification_propose_step():
+    steps = [
+        _step(
+            "draft-change-sql",
+            status="running",
+            phase="propose",
+            operation_type="schema_change",
+            risk_level="high",
+            expected_tools=["postgres_sql_classify"],
+            evidence_required=["sql_classification"],
+            tool_policy="read_only_tools",
+            success_criteria=["SQL classified"],
+        )
+    ]
+    observation = {
+        "id": "obs-classify",
+        "step_id": "draft-change-sql",
+        "type": "sql_classification",
+        "source_tool": "postgres_sql_classify",
+        "summary": "SQL classified as schema_change with high risk.",
+        "payload": {"success": True, "sql_hash": "hash-1"},
+        "created_at": "now",
+    }
+
+    result = verify_step(
+        _state(
+            steps,
+            current_step_id="draft-change-sql",
+            db_observations=[observation],
+        )
+    )
+
+    assert result["task_stack"][0]["status"] == "completed"
+    assert result["verification_results"][0]["status"] == "passed"
+
+
 def test_verify_step_waits_for_required_table_listing_evidence():
     steps = [
         _step(
@@ -501,6 +648,50 @@ def test_verify_step_blocks_repeated_readonly_sql_error_without_evidence():
 
     assert result["loop_status"] == "blocked"
     assert result["task_stack"][0]["status"] == "failed"
+
+
+def test_verify_step_accepts_expected_readonly_error_with_recovery_evidence():
+    steps = [
+        _step(
+            "probe-readonly-error",
+            status="running",
+            phase="observe",
+            operation_type="diagnostic",
+            tool_policy="read_only_tools",
+            expected_tools=["postgres_query_readonly", "postgres_object_detail"],
+            evidence_required=["sql_error", "schema_summary"],
+        )
+    ]
+    failed = {
+        "tool_call_id": "call-bad",
+        "tool_name": "postgres_query_readonly",
+        "success": False,
+        "result_type": "sql_error",
+        "summary": 'column "not_exist_column" does not exist',
+        "sqlstate": "42703",
+    }
+    recovery = {
+        "id": "obs-detail",
+        "step_id": "probe-readonly-error",
+        "type": "object_detail",
+        "source_tool": "postgres_object_detail",
+        "summary": "Collected details for public.big_orders_demo.",
+        "payload": {"success": True, "columns": [{"column_name": "id"}]},
+        "created_at": "now",
+    }
+
+    result = verify_step(
+        _state(
+            steps,
+            current_step_id="probe-readonly-error",
+            db_observations=[recovery],
+            tool_execution_results=[failed],
+            tool_invocation_records=[{"call_id": "call-bad", "step_id": "probe-readonly-error"}],
+        )
+    )
+
+    assert result["loop_status"] == "running"
+    assert result["task_stack"][0]["status"] == "completed"
 
 
 def test_verify_report_step_waits_for_assistant_content():

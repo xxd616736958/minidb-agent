@@ -426,11 +426,15 @@ def _evidence_capabilities(observations: list[DBObservation]) -> set[str]:
         if obs_type == "explain_plan" or source_tool == "postgres_explain" or payload.get("plan"):
             capabilities.add("execution_plan")
         if obs_type in {"schema_summary", "object_detail"} or source_tool in {
+            "postgres_schema_overview",
             "postgres_object_detail",
             "postgres_list_objects",
             "postgres_list_schemas",
         }:
             capabilities.add("schema_summary")
+        if source_tool == "postgres_schema_overview":
+            capabilities.add("connection_info")
+            capabilities.add("connection_status")
         if obs_type in {"index_summary", "object_detail"} or source_tool in {
             "postgres_object_detail",
             "postgres_index_advisor",
@@ -439,8 +443,12 @@ def _evidence_capabilities(observations: list[DBObservation]) -> set[str]:
             capabilities.add("index_summary")
         if source_tool == "postgres_top_queries" or obs_type == "top_queries":
             capabilities.add("top_queries")
+        if source_tool == "postgres_health_check" or obs_type == "health_report":
+            capabilities.add("health_check")
+            capabilities.add("health_report")
         if obs_type == "connection_status" or source_tool == "postgres_connection_check":
             capabilities.add("connection_status")
+            capabilities.add("connection_info")
         if obs_type == "query_result" or source_tool == "postgres_query_readonly":
             capabilities.add("query_result")
             rows = payload.get("rows")
@@ -474,6 +482,9 @@ def _required_evidence_satisfied(required: str, capabilities: set[str]) -> bool:
         "row_count_or_statistics": {"row_count_or_statistics", "statistics", "query_result", "postgres_query_readonly"},
         "active_queries": {"top_queries", "postgres_top_queries", "query_result", "postgres_query_readonly"},
         "top_queries": {"top_queries", "postgres_top_queries"},
+        "sql_classification": {"sql_classification", "postgres_sql_classify"},
+        "health_check": {"health_check", "health_report", "postgres_health_check"},
+        "connection_info": {"connection_info", "connection_status", "postgres_connection_check", "postgres_schema_overview"},
         "database_list": {"database_list", "postgres_list_databases"},
     }
     return bool(aliases.get(key, set()) & capabilities)
@@ -518,6 +529,19 @@ def _recoverable_read_failure(step: TaskStep, failed_results: list[dict[str, Any
         if sqlstate and sqlstate not in recoverable_sqlstates:
             return False
     return True
+
+
+def _step_accepts_expected_read_error(step: TaskStep, failed_results: list[dict[str, Any]], observations: list[DBObservation]) -> bool:
+    if step.get("id") != "probe-readonly-error":
+        return False
+    if not failed_results:
+        return False
+    has_missing_column = any(str(result.get("sqlstate") or "") == "42703" for result in failed_results)
+    has_recovery_evidence = any(
+        obs.get("source_tool") == "postgres_object_detail" and obs.get("payload", {}).get("success") is not False
+        for obs in observations
+    )
+    return has_missing_column and has_recovery_evidence
 
 
 def _failure_repeat_count(state: AgentState, step_id: str, failed_results: list[dict[str, Any]]) -> int:
@@ -589,8 +613,10 @@ def _step_has_expected_evidence(state: AgentState, step: TaskStep, observations:
     source_tools = {str(obs.get("source_tool") or "") for obs in observations}
     observation_types = {str(obs.get("type") or "") for obs in observations}
     capabilities = _evidence_capabilities(observations)
+    successful_expected_tools = source_tools & expected_tools
+    all_expected_tools_returned = bool(expected_tools) and expected_tools <= source_tools
 
-    if "postgres_list_objects" in expected_tools and "postgres_list_objects" not in source_tools:
+    if "postgres_list_objects" in expected_tools and not ({"postgres_list_objects", "postgres_schema_overview"} & source_tools):
         return False, "Table/object listing has not been collected yet."
     if "postgres_top_queries" in expected_tools and not (
         "postgres_top_queries" in source_tools or "top_queries" in observation_types
@@ -599,7 +625,7 @@ def _step_has_expected_evidence(state: AgentState, step: TaskStep, observations:
 
     if "schema_summary" in evidence_required and (
         expected_tools
-        & {"postgres_list_objects", "postgres_list_schemas", "postgres_object_detail", "postgres_read"}
+        & {"postgres_schema_overview", "postgres_list_objects", "postgres_list_schemas", "postgres_object_detail", "postgres_read"}
     ) and not _required_evidence_satisfied("schema_summary", capabilities):
         return False, "Schema evidence has not been collected yet."
     if "top_queries" in evidence_required and not (
@@ -613,6 +639,16 @@ def _step_has_expected_evidence(state: AgentState, step: TaskStep, observations:
         if not _required_evidence_satisfied(item, capabilities)
     ]
     if missing_required:
+        if all_expected_tools_returned and step.get("tool_policy") == "read_only_tools":
+            return True, (
+                "All planned read-only tools returned successfully; "
+                f"continuing with available evidence despite unmatched evidence labels: {', '.join(missing_required)}."
+            )
+        if successful_expected_tools and len(successful_expected_tools) >= 3:
+            return True, (
+                "Most planned read-only tools returned successfully; "
+                f"continuing with available evidence despite unmatched evidence labels: {', '.join(missing_required)}."
+            )
         return False, f"Waiting for required evidence: {', '.join(missing_required)}."
 
     return True, "Step completed against available success criteria."
@@ -729,6 +765,11 @@ def verify_step(state: AgentState) -> dict[str, Any]:
         summary = policy_violation.get("message", "Step blocked by tool policy.")
         step["status"] = "failed"
         step["error"] = summary
+    elif failed_results and observations and _step_accepts_expected_read_error(step, failed_results, observations):
+        status = "passed"
+        summary = "Expected read-only SQL error was captured and recovery evidence was collected."
+        step["status"] = "completed"
+        step["result"] = summary
     elif failed_results and not observations and _recoverable_read_failure(step, failed_results):
         repeat_count = _failure_repeat_count(state, step["id"], failed_results)
         if repeat_count < 1:

@@ -20,6 +20,10 @@ def _should_skip_delivery(state: AgentState) -> bool:
     if not packages:
         return False
     latest = packages[-1]
+    active_contract = state.get("active_delivery_contract") or {}
+    plan = state.get("db_task_plan") or {}
+    if plan.get("id") and active_contract.get("plan_id") != plan.get("id"):
+        return False
     runtime = state.get("db_task_runtime") or {}
     status = latest.get("status")
     if status in {"ready", "blocked", "failed"} and runtime.get("task_status") in {"completed", "blocked"}:

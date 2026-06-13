@@ -5,7 +5,13 @@ from __future__ import annotations
 from agent.nodes.agent_loop import tool_policy_gate
 from execution.environment import build_database_environment_profile, build_runtime_policy
 from safety.engine import SecurityPolicyEngine, build_sql_safety_report
-from tools.builtin.postgres import PostgresDryRunTool, PostgresExecuteWriteTool, PostgresQueryReadonlyTool
+from tools.builtin.postgres import (
+    PostgresCreateIndexConcurrentlyTool,
+    PostgresDryRunTool,
+    PostgresExecuteWriteTool,
+    PostgresQueryReadonlyTool,
+    PostgresSQLClassifyTool,
+)
 from tools.registry import SkillRegistry, registry
 
 
@@ -107,6 +113,45 @@ def test_security_engine_requires_sql_hash_bound_approval_for_write():
     assert approval_binding is None
 
 
+def test_security_engine_projects_parameterized_index_tool_to_approval_sql():
+    registry.register(PostgresCreateIndexConcurrentlyTool())
+    tool_call = {
+        "name": "postgres_create_index_concurrently",
+        "args": {
+            "table_name": "public.big_orders_demo",
+            "columns": ["status"],
+            "index_name": "idx_big_orders_demo_status",
+            "using": "btree",
+        },
+        "id": "call-index",
+    }
+
+    decision, sql_report, approval_binding = SecurityPolicyEngine(
+        _state(
+            task_stack=[
+                _step(
+                    id="execute-approved-change",
+                    phase="execute",
+                    operation_type="schema_change",
+                    expected_tools=["postgres_create_index_concurrently"],
+                    tool_policy="write_tools_after_approval",
+                )
+            ],
+            current_step_id="execute-approved-change",
+        )
+    ).evaluate_tool_call(tool_call, registry.get_spec("postgres_create_index_concurrently"))
+
+    assert decision["decision"] == "require_approval"
+    assert sql_report is not None
+    assert sql_report["normalized_sql_preview"] == (
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_big_orders_demo_status "
+        "ON public.big_orders_demo USING btree (status);"
+    )
+    assert decision["approval_payload"]["sql_hash"] == sql_report["sql_hash"]
+    assert decision["approval_payload"]["sql_preview"] == sql_report["normalized_sql_preview"]
+    assert approval_binding is None
+
+
 def test_security_engine_allows_write_with_matching_approval_binding():
     registry.register(PostgresExecuteWriteTool())
     sql = "UPDATE orders SET status = 'done' WHERE id = 1"
@@ -151,6 +196,66 @@ def test_security_engine_allows_write_with_matching_approval_binding():
     assert decision["decision"] == "allow"
     assert approval_binding is not None
     assert approval_binding["sql_hash"] == sql_report["sql_hash"]
+
+
+def test_security_engine_allows_write_with_dependency_approval_binding():
+    registry.register(PostgresExecuteWriteTool())
+    sql = "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_orders_status ON orders (status)"
+    sql_report = build_sql_safety_report(sql, allow_explain_analyze=True)
+    state = _state(
+        task_stack=[
+            _step(
+                id="execute-approved-change",
+                phase="execute",
+                operation_type="schema_change",
+                risk_level="high",
+                requires_approval=True,
+                requires_rollback_plan=True,
+                dependencies=["request-approval"],
+                expected_tools=["postgres_execute_write"],
+                tool_policy="write_tools_after_approval",
+            )
+        ],
+        current_step_id="execute-approved-change",
+        approval_decisions=[
+            {
+                "id": "approval-1",
+                "step_id": "request-approval",
+                "status": "approved",
+                "risk_level": "high",
+                "target_environment": "dev",
+                "sql_preview": sql,
+                "sql_hash": sql_report["sql_hash"],
+                "impact_summary": "Create optimization index.",
+                "rollback_summary": "DROP INDEX CONCURRENTLY IF EXISTS idx_orders_status",
+                "verification_criteria": ["index exists"],
+                "user_message": "approved",
+                "created_at": "now",
+                "resolved_at": "now",
+            }
+        ],
+    )
+    tool_call = {
+        "name": "postgres_execute_write",
+        "args": {
+            "sql": sql,
+            "approval_id": "approval-1",
+            "approved_sql_hash": sql_report["sql_hash"],
+            "target_environment": "dev",
+            "impact_summary": "Create optimization index.",
+            "rollback_summary": "DROP INDEX CONCURRENTLY IF EXISTS idx_orders_status",
+        },
+        "id": "call-write",
+    }
+
+    decision, _, approval_binding = SecurityPolicyEngine(state).evaluate_tool_call(
+        tool_call,
+        registry.get_spec("postgres_execute_write"),
+    )
+
+    assert decision["decision"] == "allow"
+    assert approval_binding is not None
+    assert approval_binding["approval_id"] == "approval-1"
 
 
 def test_security_engine_denies_readonly_tool_with_write_sql():
@@ -271,3 +376,42 @@ def test_tool_policy_gate_creates_pending_approval_for_write_call():
     assert update["pending_approval"]["sql_hash"] == update["sql_safety_reports"][0]["sql_hash"]
     assert update["loop_status"] == "waiting_for_approval"
     assert msg.tool_calls
+
+
+def test_sql_classify_tool_can_classify_schema_change_without_write_approval():
+    from langchain_core.messages import AIMessage
+
+    registry.register(PostgresSQLClassifyTool())
+    msg = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "postgres_sql_classify",
+                "args": {
+                    "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_orders_status ON public.orders (status);",
+                    "allow_explain_analyze": False,
+                },
+                "id": "call-classify",
+            }
+        ],
+    )
+    state = _state(
+        messages=[msg],
+        task_stack=[
+            _step(
+                id="draft-change-sql",
+                phase="propose",
+                operation_type="schema_change",
+                risk_level="high",
+                expected_tools=["postgres_sql_classify"],
+                tool_policy="read_only_tools",
+            )
+        ],
+        current_step_id="draft-change-sql",
+    )
+
+    update = tool_policy_gate(state)
+
+    assert update["tool_policy_decisions"][0]["decision"] == "allow"
+    assert update["sql_safety_reports"][0]["classification"] == "schema_change"
+    assert "pending_approval" not in update

@@ -157,8 +157,12 @@ def _evidence_capabilities(observations: list[DBObservation]) -> set[str]:
             capabilities.add("index_summary")
         if source_tool == "postgres_top_queries" or obs_type == "top_queries":
             capabilities.add("top_queries")
+        if source_tool == "postgres_health_check" or obs_type == "health_report":
+            capabilities.add("health_check")
+            capabilities.add("health_report")
         if obs_type == "connection_status" or source_tool == "postgres_connection_check":
             capabilities.add("connection_status")
+            capabilities.add("connection_info")
         if obs_type == "query_result" or source_tool == "postgres_query_readonly":
             capabilities.add("query_result")
             if payload.get("rows"):
@@ -190,7 +194,8 @@ def _evidence_satisfied(required: str, capabilities: set[str]) -> bool:
         "active_queries": {"top_queries", "postgres_top_queries", "query_result", "postgres_query_readonly"},
         "slow_query_sample": {"top_queries", "postgres_top_queries", "query_result", "postgres_query_readonly"},
         "top_queries": {"top_queries", "postgres_top_queries"},
-        "connection_info": {"connection_status", "postgres_connection_check"},
+        "health_check": {"health_check", "health_report", "postgres_health_check"},
+        "connection_info": {"connection_info", "connection_status", "postgres_connection_check", "postgres_schema_overview"},
     }
     return bool(aliases.get(key, set()) & capabilities)
 

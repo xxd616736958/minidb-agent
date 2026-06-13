@@ -208,7 +208,35 @@ def test_manifest_collects_evidence_and_sql_metadata(tmp_path):
     assert manifest["sql_items"][0]["safety_report_id"] == "sql-report-1"
 
 
-def test_delivery_quality_gate_blocks_missing_required_write_approval(tmp_path):
+def test_manifest_handles_approval_without_safety_report(tmp_path):
+    state = _state(
+        tmp_path,
+        approval_decisions=[
+            {
+                "id": "approval-1",
+                "step_id": "observe",
+                "status": "approved",
+                "risk_level": "high",
+                "target_environment": "staging",
+                "sql_preview": "ALTER TABLE orders ADD COLUMN note text",
+                "sql_hash": "hash-1",
+                "impact_summary": "Adds nullable column",
+                "rollback_summary": "ALTER TABLE orders DROP COLUMN note",
+                "user_message": "approved",
+                "created_at": "now",
+                "resolved_at": "now",
+            }
+        ],
+        sql_safety_reports=[],
+    )
+
+    manifest = DeliveryManager(state).build_manifest()
+
+    assert manifest["sql_items"][0]["approval_id"] == "approval-1"
+    assert manifest["sql_items"][0]["safety_report_id"] is None
+
+
+def test_delivery_quality_gate_allows_draft_write_sql_without_execution_approval(tmp_path):
     state = _state(
         tmp_path,
         current_intent={**_state(tmp_path)["current_intent"], "operation_nature": "schema_change", "requires_approval": True, "requires_rollback_plan": True},
@@ -230,8 +258,45 @@ def test_delivery_quality_gate_blocks_missing_required_write_approval(tmp_path):
     manifest = manager.build_manifest()
     gate = manager.delivery_quality_gate(contract, manifest, report_paths=["/tmp/final_report.md"])
 
-    assert gate["status"] == "failed"
-    assert "write_items_have_approval" in gate["failed_checks"]
+    assert gate["status"] == "passed"
+    assert "write_items_have_approval" not in gate["failed_checks"]
+    assert "approve_execution" in manager.next_actions(contract, manifest, manifest["missing_items"])
+
+
+def test_delivery_accepts_call_id_as_sql_safety_evidence(tmp_path):
+    state = _state(
+        tmp_path,
+        current_intent={
+            **_state(tmp_path)["current_intent"],
+            "operation_nature": "schema_change",
+            "requires_approval": True,
+            "requires_rollback_plan": True,
+        },
+        tool_invocation_records=[
+            {"call_id": "call-classify", "step_id": "observe"},
+        ],
+        sql_safety_reports=[
+            {
+                "call_id": "call-classify",
+                "tool_call_id": "call-classify",
+                "step_id": "observe",
+                "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_orders_status ON orders (status);",
+                "sql_hash": "hash-1",
+                "classification": "schema_change",
+                "risk_level": "high",
+                "allowed": True,
+                "reasons": [],
+                "created_at": "now",
+            }
+        ],
+    )
+    manager = DeliveryManager(state)
+    contract = manager.build_contract()
+    manifest = manager.build_manifest()
+    gate = manager.delivery_quality_gate(contract, manifest, report_paths=["/tmp/final_report.md"])
+
+    assert manifest["sql_items"][0]["safety_report_id"] == "call-classify"
+    assert gate["status"] == "passed"
 
 
 def test_diagnostic_only_sql_items_do_not_require_approval_package(tmp_path):
@@ -283,6 +348,96 @@ def test_diagnostic_only_sql_items_do_not_require_approval_package(tmp_path):
     assert "sql_items_have_safety_metadata" not in gate_without_safety_id["failed_checks"]
 
 
+def test_delivery_filters_evidence_and_sql_to_current_plan(tmp_path):
+    state = _state(
+        tmp_path,
+        db_task_plan={
+            **_state(tmp_path)["db_task_plan"],
+            "id": "plan-current",
+            "steps": [_step(id="current-step")],
+        },
+        task_stack=[_step(id="current-step")],
+        task_workspace={
+            **_state(tmp_path)["task_workspace"],
+            "task_id": "plan-current",
+            "plan_id": "plan-current",
+        },
+        db_observations=[
+            {
+                "id": "obs-old",
+                "step_id": "old-step",
+                "type": "top_queries",
+                "source_tool": "postgres_top_queries",
+                "summary": "Old top query",
+                "payload": {"queries": [{"query_preview": "SELECT old"}]},
+                "created_at": "now",
+            },
+            {
+                "id": "obs-current",
+                "step_id": "current-step",
+                "type": "object_detail",
+                "source_tool": "postgres_object_detail",
+                "summary": "Current object detail",
+                "payload": {"columns": [{"column_name": "id"}]},
+                "created_at": "now",
+            },
+        ],
+        tool_invocation_records=[
+            {"call_id": "call-old", "step_id": "old-step"},
+            {"call_id": "call-current", "step_id": "current-step"},
+        ],
+        tool_execution_results=[
+            {
+                "tool_call_id": "call-old",
+                "tool_name": "postgres_sql_classify",
+                "success": True,
+                "result_type": "sql_classification",
+                "summary": "Old DDL",
+                "payload": {
+                    "sql": "CREATE INDEX idx_old ON old_table (id);",
+                    "sql_hash": "hash-old",
+                    "primary_type": "schema_change",
+                    "risk_level": "high",
+                },
+            },
+            {
+                "tool_call_id": "call-current",
+                "tool_name": "postgres_query_readonly",
+                "success": True,
+                "result_type": "query_result",
+                "summary": "Current rows",
+                "payload": {"rows": [{"id": 1}]},
+            },
+        ],
+        sql_safety_reports=[
+            {
+                "id": "sql-old",
+                "call_id": "call-old",
+                "sql": "CREATE INDEX idx_old ON old_table (id);",
+                "sql_hash": "hash-old",
+                "classification": "schema_change",
+                "risk_level": "high",
+            }
+        ],
+        verification_results=[
+            {
+                "id": "verify-current",
+                "step_id": "current-step",
+                "status": "passed",
+                "criteria_checked": [],
+                "evidence_ids": ["obs-current"],
+                "summary": "current done",
+                "created_at": "now",
+            }
+        ],
+    )
+
+    manifest = DeliveryManager(state).build_manifest()
+
+    assert [ref["source_id"] for ref in manifest["evidence_refs"] if ref["source_type"] == "db_observation"] == ["obs-current"]
+    assert manifest["sql_items"] == []
+
+
 def test_final_report_node_writes_reports_and_package(tmp_path):
     update = final_report(_state(tmp_path))
 
@@ -308,6 +463,37 @@ def test_final_report_uses_runtime_completed_over_stale_loop_status(tmp_path):
 
     assert package["status"] == "ready"
     assert "Delivery status: ready" in report
+
+
+def test_final_report_does_not_skip_new_plan_when_previous_package_exists(tmp_path):
+    state = _state(
+        tmp_path,
+        active_delivery_contract={"id": "contract-old", "plan_id": "plan-old", "status": "ready"},
+        delivery_packages=[
+            {
+                "id": "package-old",
+                "task_id": "task-old",
+                "contract_id": "contract-old",
+                "title": "old task",
+                "status": "ready",
+                "summary": "old delivery",
+                "user_report_path": None,
+                "audit_report_path": None,
+                "manifest_id": "manifest-old",
+                "artifact_ids": [],
+                "quality_gate_ids": [],
+                "next_actions": [],
+                "created_at": "now",
+                "delivered_at": "now",
+            }
+        ],
+        db_task_runtime={"task_status": "completed", "risk_level": "low"},
+    )
+
+    update = final_report(state)
+
+    assert update["delivery_packages"][0]["id"] != "package-old"
+    assert update["active_delivery_contract"]["plan_id"] == "plan-1"
 
 
 def test_final_report_treats_recovered_report_error_as_ready_delivery(tmp_path):
@@ -340,8 +526,18 @@ def test_final_report_treats_recovered_report_error_as_ready_delivery(tmp_path):
 
 
 def test_final_report_includes_top_query_findings(tmp_path):
+    top_query_step = _step(
+        id="collect-top-queries",
+        description="Collect top query evidence",
+        expected_tools=["postgres_top_queries"],
+    )
     state = _state(
         tmp_path,
+        db_task_plan={
+            **_state(tmp_path)["db_task_plan"],
+            "steps": [top_query_step],
+        },
+        task_stack=[top_query_step],
         db_observations=[
             {
                 "id": "obs-top",
@@ -390,8 +586,18 @@ def test_final_report_includes_top_query_findings(tmp_path):
 
 
 def test_final_report_uses_aggregate_hint_for_grouped_top_query(tmp_path):
+    top_query_step = _step(
+        id="collect-top-queries",
+        description="Collect top query evidence",
+        expected_tools=["postgres_top_queries"],
+    )
     state = _state(
         tmp_path,
+        db_task_plan={
+            **_state(tmp_path)["db_task_plan"],
+            "steps": [top_query_step],
+        },
+        task_stack=[top_query_step],
         db_observations=[
             {
                 "id": "obs-top",

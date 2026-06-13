@@ -34,6 +34,11 @@ Design principles:
 - Use coarse intent families, not fine-grained action names.
 - Allow multiple candidate_intents when the request is mixed or ambiguous.
 - Classify risk conservatively for database operations.
+- Put task-shape details in output_contract.task_kind instead of creating
+  phrase-specific intents. Supported task_kind values include:
+  target_overview, health_check, table_listing, database_listing,
+  optimization_target, deep_optimization_analysis, optimization_execution,
+  change_sql_draft, readonly_error_probe, general_report.
 - Interpret the latest message in conversation context. If it answers a
   pending clarification, merge it into the existing intent instead of treating
   it as a new unrelated task.
@@ -50,6 +55,18 @@ Design principles:
 - Do not ask users to choose a default diagnostic sort metric. For "slowest SQL"
   requests, start with pg_stat_statements ordered by total time / mean time when
   available, then explain the metric used.
+- If the user asks the agent to optimize or fix the slowest / most important
+  SQL and does not explicitly restrict the work to read-only planning, classify
+  it as primary_intent="performance_optimization",
+  operation_nature="schema_change", risk_level="high",
+  requires_approval=true, requires_rollback_plan=true, and
+  output_contract.task_kind="optimization_execution". The workflow must still
+  observe, diagnose, propose, request approval, execute only the approved SQL,
+  verify, and report.
+- If the user asks to analyze an optimization plan without executing writes,
+  classify it as performance_diagnosis and set
+  output_contract.task_kind="deep_optimization_analysis" with
+  output_contract.read_only_only=true.
 - Ask clarification only when the target connection is unavailable, mutation
   scope is unsafe or ambiguous, a destructive operation lacks safety filters, or
   the user's goal cannot be inferred from the conversation.
@@ -61,6 +78,7 @@ Design principles:
 Allowed primary_intent values:
 - read_only_analysis
 - performance_diagnosis
+- performance_optimization
 - schema_change
 - data_change
 - permission_admin
@@ -72,6 +90,7 @@ Allowed primary_intent values:
 Allowed suggested_workflow values:
 - read_only_analysis_workflow
 - performance_diagnosis_workflow
+- performance_optimization_workflow
 - schema_change_workflow
 - data_change_workflow
 - permission_admin_workflow
@@ -99,7 +118,11 @@ Return ONLY valid JSON with these fields:
   "target_database": null,
   "target_objects": [],
   "input_artifacts": [],
-  "output_contract": {},
+  "output_contract": {
+    "task_kind": "target_overview|health_check|table_listing|database_listing|optimization_target|deep_optimization_analysis|optimization_execution|change_sql_draft|readonly_error_probe|general_report",
+    "read_only_only": false,
+    "expected_report_sections": []
+  },
   "missing_slots": [],
   "assumptions": [],
   "constraints": [],
@@ -138,6 +161,7 @@ _VALID_NEXT_ACTIONS = {
 _INTENT_TO_WORKFLOW = {
     "read_only_analysis": "read_only_analysis_workflow",
     "performance_diagnosis": "performance_diagnosis_workflow",
+    "performance_optimization": "performance_optimization_workflow",
     "schema_change": "schema_change_workflow",
     "data_change": "data_change_workflow",
     "permission_admin": "permission_admin_workflow",
@@ -520,6 +544,10 @@ def intent_analyzer(state: AgentState) -> dict[str, Any]:
         "current_intent": intent,
         "intent_history": [intent],
         "selected_workflow": intent.get("suggested_workflow"),
+        "intent_strategy": {
+            "type": "llm_structured_intent",
+            "model_call_skipped": False,
+        },
         **explicit_memory_updates,
         **feedback_updates,
     }
@@ -864,6 +892,14 @@ WORKFLOW_DESCRIPTIONS = {
         "只读收集执行计划、索引、行数和统计信息",
         "判断瓶颈并给出优化方案",
         "如需变更，先生成方案、影响范围和回滚计划",
+    ],
+    "performance_optimization_workflow": [
+        "收集慢 SQL 候选并选择优化目标",
+        "只读收集执行计划、表结构、索引和统计信息",
+        "生成优化方案、影响、回滚和验证标准",
+        "等待用户审批后执行确切变更",
+        "执行后用只读证据验证效果",
+        "报告执行结果、回滚方式和剩余风险",
     ],
     "schema_change_workflow": [
         "确认环境、目标对象和变更目标",

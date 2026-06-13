@@ -556,12 +556,32 @@ class AgentRepl:
             print_tool_done(label, "stream ended before a tool result was returned", success=False)
 
     def _print_delivery_status(self, output: dict[str, Any]) -> None:
+        sections = output.get("report_sections") or []
+        if sections:
+            self._print_report_sections(sections)
         packages = output.get("delivery_packages") or []
         if packages:
             latest = packages[-1]
             status = latest.get("status") or "ready"
             title = latest.get("title") or "delivery"
             print_agent_status(f"done: {title} ({status})")
+
+    def _print_report_sections(self, sections: list[dict[str, Any]]) -> None:
+        preferred = ("assistant_report", "findings", "diagnosis", "execution", "risk", "verification", "next_steps")
+        printed = False
+        for purpose in preferred:
+            for section in sections:
+                if section.get("purpose") != purpose:
+                    continue
+                content = str(section.get("content") or "").strip()
+                if not content or content == "No content.":
+                    continue
+                title = str(section.get("title") or purpose)
+                console.print(Markdown(f"### {title}\n\n{content}"))
+                printed = True
+                break
+        if printed:
+            return
 
     def _process_messages(self, msgs: list, is_tool: bool = False, show_tool_json: bool = True):
         """Process and display messages — handles both dict and object formats."""
@@ -664,6 +684,8 @@ class AgentRepl:
             schema = args.get("schema_name") or args.get("schema") or result.get("payload", {}).get("schema") or "public"
             object_type = args.get("object_type") or result.get("payload", {}).get("object_type") or "table"
             return f"list {schema}.{object_type}s"
+        if tool_name == "postgres_schema_overview":
+            return "inspect PostgreSQL target overview"
         if tool_name == "postgres_object_detail":
             schema = args.get("schema_name") or args.get("schema") or "public"
             name = args.get("object_name") or args.get("table") or args.get("name") or "object"
@@ -690,6 +712,13 @@ class AgentRepl:
                 return f"{summary}; top: {self._compact_sql(query)}{metric_text}"
         if result_type == "schema_summary":
             objects = payload.get("objects") or payload.get("schemas") or []
+            if payload.get("connection") and payload.get("tables") is not None:
+                conn = payload.get("connection") or {}
+                schemas = payload.get("schemas") or []
+                tables = payload.get("tables") or []
+                db = conn.get("database") or "unknown"
+                user = conn.get("user") or "unknown"
+                return f"{summary}; database={db} user={user} schemas={len(schemas)} tables={len(tables)}"
             if objects:
                 names = []
                 for item in objects[:5]:
