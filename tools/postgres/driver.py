@@ -54,6 +54,7 @@ class PostgresDriver:
         max_rows: int = 100,
         statement_timeout_ms: int | None = None,
         lock_timeout_ms: int | None = None,
+        autocommit: bool = False,
     ) -> QueryResult:
         """Execute SQL and return masked, limited rows."""
         self.manager.check_configured()
@@ -69,9 +70,17 @@ class PostgresDriver:
         started = time.monotonic()
         try:
             with psycopg.connect(self.manager.database_url, row_factory=dict_row) as conn:
+                if autocommit:
+                    conn.autocommit = True
                 with conn.cursor() as cur:
-                    cur.execute("SET statement_timeout = %s", (statement_timeout_ms,))
-                    cur.execute("SET lock_timeout = %s", (lock_timeout_ms,))
+                    cur.execute(
+                        "SELECT set_config('statement_timeout', %s, %s)",
+                        (str(int(statement_timeout_ms)), not autocommit),
+                    )
+                    cur.execute(
+                        "SELECT set_config('lock_timeout', %s, %s)",
+                        (str(int(lock_timeout_ms)), not autocommit),
+                    )
                     if readonly:
                         cur.execute("BEGIN TRANSACTION READ ONLY")
                     cur.execute(sql, params)
@@ -79,7 +88,9 @@ class PostgresDriver:
                     if cur.description is not None:
                         rows = [dict(row) for row in cur.fetchall()]
                     affected = cur.rowcount if cur.description is None and cur.rowcount >= 0 else None
-                    if readonly:
+                    if autocommit:
+                        pass
+                    elif readonly:
                         conn.rollback()
                     else:
                         conn.commit()

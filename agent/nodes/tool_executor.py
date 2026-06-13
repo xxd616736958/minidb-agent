@@ -14,7 +14,7 @@ import re
 from typing import Any
 from datetime import datetime, timezone
 
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
 
 from agent.state import AgentState
 from collaboration.manager import CollaborationManager
@@ -24,6 +24,7 @@ from safety.engine import SecurityPolicyEngine
 from state_management.manager import StateManager
 from state_management.validator import StateValidator
 from tools.postgres.results import loads_result
+from tools.policy import tool_call_items
 from tools.registry import registry
 
 logger = logging.getLogger(__name__)
@@ -196,7 +197,7 @@ def execute_tools(state: AgentState) -> dict[str, Any]:
         return {"error": "No messages in state", "step_count": state.get("step_count", 0) + 1}
 
     last_msg = messages[-1]
-    tool_calls = getattr(last_msg, "tool_calls", None)
+    tool_calls = tool_call_items(last_msg)
     if not tool_calls:
         logger.warning("execute_tools called but last message has no tool_calls")
         return {"step_count": state.get("step_count", 0) + 1}
@@ -214,7 +215,13 @@ def execute_tools(state: AgentState) -> dict[str, Any]:
     started_at = datetime.now(timezone.utc)
     try:
         tool_node = _get_tool_node()
-        result = tool_node.invoke({"messages": messages})
+        execution_messages = list(messages)
+        if isinstance(last_msg, dict):
+            execution_messages[-1] = AIMessage(
+                content=str(last_msg.get("content") or ""),
+                tool_calls=tool_calls,
+            )
+        result = tool_node.invoke({"messages": execution_messages})
     except Exception as e:
         logger.error(f"ToolNode execution failed: {e}")
         return {

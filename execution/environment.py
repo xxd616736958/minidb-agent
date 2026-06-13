@@ -104,6 +104,7 @@ def build_database_environment_profile(database_url: str | None = None) -> Datab
         "environment_name": env_name,  # type: ignore[typeddict-item]
         "target_database": parsed.path.lstrip("/") if parsed and parsed.path else None,
         "safe_host_label": parsed.hostname if parsed else None,
+        "safe_port": parsed.port if parsed else None,
         "safe_user_label": parsed.username if parsed else None,
         "access_mode": access_mode,  # type: ignore[typeddict-item]
         "is_production": is_production,

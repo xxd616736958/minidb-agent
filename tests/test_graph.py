@@ -8,12 +8,14 @@ from agent.edges.routes import (
     route_after_delegation_planner,
     route_after_planner,
     route_after_start,
+    route_after_approval_response,
     route_after_intent_validator,
     route_after_clarification,
     route_after_policy_gate,
     route_after_tools,
     route_after_error_handler,
     END,
+    APPROVAL_RESPONSE,
     INTENT_ANALYZER,
     CLARIFICATION_GATE,
     WORKFLOW_PLANNER,
@@ -133,6 +135,22 @@ class TestRouting:
         state = self._make_state(messages=[msg])
         assert route_after_llm(state) == TOOL_POLICY_GATE
 
+    def test_route_after_llm_with_serialized_tool_calls(self):
+        """Serialized server messages with tool calls still route to policy gate."""
+        state = self._make_state(
+            messages=[
+                {
+                    "type": "ai",
+                    "content": "",
+                    "tool_calls": [
+                        {"name": "postgres_list_objects", "args": {"object_type": "table"}, "id": "call-1"}
+                    ],
+                }
+            ]
+        )
+
+        assert route_after_llm(state) == TOOL_POLICY_GATE
+
     def test_route_after_llm_with_error(self):
         """Error → error_handler."""
         state = self._make_state(error="Something went wrong")
@@ -197,6 +215,22 @@ class TestRouting:
             },
         )
         assert route_after_policy_gate(state) == END
+
+    def test_route_after_start_handles_cli_approval_response_first(self):
+        state = self._make_state(
+            cli_approval_response={"action": "approve", "approval_id": "approval-1"},
+            pending_approval={"id": "approval-1", "status": "pending"},
+        )
+
+        assert route_after_start(state) == APPROVAL_RESPONSE
+
+    def test_route_after_approval_response_continues_or_replans(self):
+        assert route_after_approval_response(self._make_state()) == HUMAN_APPROVAL
+        assert (
+            route_after_approval_response(self._make_state(replan_trigger="approval_response"))
+            == TASK_PLANNER
+        )
+        assert route_after_approval_response(self._make_state(error="bad approval")) == ERROR_HANDLER
 
     def test_route_after_planner_no_error(self):
         """No error → memory_compactor."""

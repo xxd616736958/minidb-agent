@@ -126,7 +126,7 @@ candidate_intents:
 requires_clarification: false
 ```
 
-如果缺少数据库连接、时间范围、接口名称和慢 SQL 样本，则应进入澄清。
+如果没有可用数据库连接，或用户目标本身无法从上下文推断，则应进入澄清。对于已经配置好目标库的低风险只读诊断，时间范围、接口名称、阈值、样本 SQL 等属于可选范围信息，不能阻塞第一轮只读观察；Agent 应先使用安全只读发现能力收集当前可用证据，并在结论中说明假设和局限。
 
 ## 6. 推荐数据结构
 
@@ -230,19 +230,24 @@ Claude 同样依赖模型进行开放理解，但在工具调用、todo、任务
 
 **最终方案**
 
-mini-agent 使用大模型生成 `DBTaskIntent` 草稿，再用确定性校验器修正或拦截：
+mini-agent 使用大模型生成 `DBTaskIntent` 草稿，但输入不是单句用户消息，而是一个模型可见上下文包：
 
 ```text
 用户输入
-  -> LLM 生成 DBTaskIntent
-  -> validator 检查字段完整性、风险等级、SQL 关键词、环境信息
+  + 最近对话
+  + 当前 PostgreSQL 配置
+  + pending clarification
+  + current_intent
+  + runtime_policy
+  -> LLM 结合上下文生成 DBTaskIntent
+  -> validator 注入已配置环境，检查风险等级、SQL 关键词和权限边界
   -> 通过则进入 planner
   -> 不通过则进入 clarification
 ```
 
 **权衡原因**
 
-纯关键词匹配不理解上下文；纯 LLM 又不够稳定。LLM 负责语义理解，规则负责安全兜底，这是数据库场景更稳妥的组合。
+纯关键词匹配不理解上下文；纯 LLM 又不够稳定。LLM 负责语义理解和多轮澄清答案合并，规则只负责配置注入、安全兜底和权限边界，这是数据库场景更稳妥的组合。
 
 **效果**
 
@@ -282,7 +287,7 @@ Claude 在交互式权限、elicitation、REPL 和远程会话中，把需要用
 
 **最终方案**
 
-mini-agent 在 intent 阶段维护 `missing_slots`。缺少关键槽位时，不进入 planner，而是生成 `ClarificationRequest`：
+mini-agent 在 intent 阶段维护 `missing_slots`。缺少真正阻塞执行或安全判断的关键槽位时，不进入 planner，而是生成 `ClarificationRequest`：
 
 ```text
 缺少 target_environment -> 问这是生产库、测试库还是本地库
@@ -291,13 +296,15 @@ mini-agent 在 intent 阶段维护 `missing_slots`。缺少关键槽位时，不
 缺少 output_contract -> 问需要报告、SQL、诊断结论还是执行操作
 ```
 
+但澄清不是越多越安全。对于已经有 `database_environment` 的低风险只读任务，validator 会移除不会阻塞安全观察的可选槽位，例如 `target_objects_or_sql`、`sql_or_symptom`、`time_range`、`threshold`。这些信息可以由模型在后续观察中补充或在报告中作为局限说明。
+
 **权衡原因**
 
 数据库管理中，很多错误不是 SQL 写错，而是上下文不明确。先澄清比事后回滚更便宜。
 
 **效果**
 
-模糊任务不会直接执行。用户输入“帮我删掉无效数据”时，系统会先问“哪个表、无效规则、时间范围、是否备份、是否生产库”。
+模糊的高风险任务不会直接执行。用户输入“帮我删掉无效数据”时，系统会先问“哪个表、无效规则、时间范围、是否备份、是否生产库”。但用户输入“帮我看看当前数据库为什么慢”时，如果当前连接已配置，系统应先执行只读观察，而不是反复追问阈值和时间范围。
 
 ### 7.5 设计点五：风险等级在任务理解阶段产生
 
@@ -771,4 +778,3 @@ LLM 开放理解用户目标
 ```
 
 这样既不会把系统做死，也不会让数据库 Agent 完全凭自然语言自由发挥。
-

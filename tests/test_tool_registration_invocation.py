@@ -81,6 +81,22 @@ def test_dynamic_tool_pool_hides_write_tools_in_read_only_step():
     tools, specs = registry.get_for_state(_state())
     names = {tool.name for tool in tools}
 
+    assert "file_read" not in names
+    assert "code_search" not in names
+    assert "file_write" not in names
+    assert all(spec["capability"]["read_only"] for spec in specs)
+
+
+def test_dynamic_tool_pool_keeps_generic_read_tools_for_non_postgres_context():
+    registry = SkillRegistry()
+    registry.register(FileReadTool())
+    registry.register(FileWriteTool())
+    registry.register(CodeSearchTool())
+
+    state = _state(current_intent={"domain": "general"}, task_stack=[_step(expected_tools=[])])
+    tools, specs = registry.get_for_state(state)
+    names = {tool.name for tool in tools}
+
     assert "file_read" in names
     assert "code_search" in names
     assert "file_write" not in names

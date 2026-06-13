@@ -19,6 +19,7 @@ from langgraph.graph import END, START, StateGraph
 
 from agent.config import get_settings
 from agent.edges.routes import (
+    APPROVAL_RESPONSE,
     INTENT_ANALYZER,
     INTENT_VALIDATOR,
     CLARIFICATION_GATE,
@@ -37,6 +38,7 @@ from agent.edges.routes import (
     TOOL_POLICY_GATE,
     VERIFY_STEP,
     route_after_approval,
+    route_after_approval_response,
     route_after_clarification,
     route_after_compactor,
     route_after_delegation_planner,
@@ -59,6 +61,7 @@ from agent.nodes.agent_loop import (
     tool_policy_gate,
     verify_step,
 )
+from agent.nodes.approval_response import apply_cli_approval_response
 from agent.nodes.delegation_planner import delegation_planner
 from agent.nodes.error_handler import error_handler
 from agent.nodes.final_report import final_report
@@ -96,7 +99,7 @@ def build_graph() -> StateGraph:
 
     # ── Discover tools ───────────────────────────────────
     logger.info("Discovering tools via SkillRegistry...")
-    registry.discover("tools.builtin", "plugins")
+    registry.discover("tools.builtin")
     logger.info(f"Registered {registry.count} tools: {registry.get_names()}")
 
     # Note: Custom checkpointer is NOT used — LangGraph API platform
@@ -108,6 +111,7 @@ def build_graph() -> StateGraph:
 
     # Register nodes
     builder.add_node(INTENT_ANALYZER, intent_analyzer)
+    builder.add_node(APPROVAL_RESPONSE, apply_cli_approval_response)
     builder.add_node(INTENT_VALIDATOR, intent_validator)
     builder.add_node(CLARIFICATION_GATE, clarification_gate)
     builder.add_node(WORKFLOW_PLANNER, workflow_planner)
@@ -133,8 +137,19 @@ def build_graph() -> StateGraph:
         STATE_RECOVERY,
         route_after_start,
         {
+            "approval_response": APPROVAL_RESPONSE,
             "intent_analyzer": INTENT_ANALYZER,
             "human_approval": HUMAN_APPROVAL,
+        },
+    )
+
+    builder.add_conditional_edges(
+        APPROVAL_RESPONSE,
+        route_after_approval_response,
+        {
+            "human_approval": HUMAN_APPROVAL,
+            "task_planner": TASK_PLANNER,
+            "error_handler": ERROR_HANDLER,
         },
     )
 

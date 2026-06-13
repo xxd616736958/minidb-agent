@@ -368,6 +368,27 @@ def _intent_risk(intent: dict[str, Any] | None) -> str:
     return risk if risk in RISK_LEVELS else "low"
 
 
+def _is_write_intent(intent: dict[str, Any] | None) -> bool:
+    if not intent:
+        return False
+    return bool(intent.get("requires_approval")) or str(intent.get("operation_nature") or "") in WRITE_OPERATION_TYPES
+
+
+def _should_force_top_query_path(intent: dict[str, Any] | None, goal_text: str) -> bool:
+    if not _is_top_query_request(goal_text):
+        return False
+    if _is_write_intent(intent):
+        return False
+    primary = str((intent or {}).get("primary_intent") or "")
+    operation = str((intent or {}).get("operation_nature") or "")
+    workflow = str((intent or {}).get("suggested_workflow") or "")
+    return (
+        primary == "performance_diagnosis"
+        or workflow == "performance_diagnosis_workflow"
+        or operation in {"diagnostic", "read_only", "unknown", ""}
+    )
+
+
 def _workflow_default_steps(state: AgentState) -> list[dict[str, Any]]:
     """Deterministic fallback steps when the planner LLM returns no usable plan."""
     intent = state.get("current_intent") or {}
@@ -375,6 +396,15 @@ def _workflow_default_steps(state: AgentState) -> list[dict[str, Any]]:
     goal = intent.get("goal") or "Complete the user request"
     risk = _intent_risk(intent)
     evidence = intent.get("evidence_needed") or []
+    goal_text = f"{goal} {intent.get('user_language_summary') or ''}".lower()
+    is_table_listing = bool(
+        re.search(r"\b(tables?|relations?)\b", goal_text, re.IGNORECASE)
+        or any(token in goal_text for token in ("有哪些表", "列出表", "查看表", "表清单", "所有表"))
+    )
+    is_database_listing = bool(
+        re.search(r"\bdatabases?\b", goal_text, re.IGNORECASE)
+        or any(token in goal_text for token in ("有哪些数据库", "数据库列表", "当前环境存在哪些数据库"))
+    )
 
     def step(
         sid: str,
@@ -407,17 +437,19 @@ def _workflow_default_steps(state: AgentState) -> list[dict[str, Any]]:
         }
 
     if workflow == "performance_diagnosis_workflow":
+        if _should_force_top_query_path(intent, goal_text):
+            return _top_query_default_steps(evidence)
         return [
             step(
                 "collect-evidence",
-                "Collect read-only evidence for the slow PostgreSQL behavior",
+                "Collect read-only PostgreSQL evidence for slow queries and current activity",
                 "observe",
                 "diagnostic",
                 step_risk="low",
                 tool_policy="read_only_tools",
-                expected_tools=["postgres_read"],
-                evidence_required=evidence or ["execution_plan", "schema_summary", "index_summary"],
-                criteria=["Execution plan, schema, indexes, and relevant statistics are available"],
+                expected_tools=["postgres_read", "postgres_top_queries", "postgres_connection_check", "postgres_lock_inspect"],
+                evidence_required=evidence or ["top_queries", "active_queries", "connection_info"],
+                criteria=["Top or currently active queries are collected, or the unavailable source is clearly explained"],
             ),
             step(
                 "diagnose-bottleneck",
@@ -443,6 +475,88 @@ def _workflow_default_steps(state: AgentState) -> list[dict[str, Any]]:
                 "documentation",
                 ["propose-options"],
                 criteria=["Report includes evidence, cause, recommendation, risk, and next steps"],
+            ),
+        ]
+
+    if workflow == "read_only_analysis_workflow":
+        if is_table_listing:
+            return [
+                step(
+                    "list-tables",
+                    "List PostgreSQL user tables in the configured target database",
+                    "observe",
+                    "read_only",
+                    step_risk="low",
+                    tool_policy="read_only_tools",
+                    expected_tools=["postgres_list_schemas", "postgres_list_objects"],
+                    evidence_required=evidence or ["schema_summary"],
+                    criteria=["User table list is collected from PostgreSQL catalogs or the unavailable source is explained"],
+                ),
+                step(
+                    "report-tables",
+                    "Report the table list with schema names and any visibility limits",
+                    "report",
+                    "documentation",
+                    ["list-tables"],
+                    criteria=["Answer lists the discovered tables or clearly states that none were found"],
+                ),
+            ]
+        if is_database_listing:
+            return [
+                step(
+                    "list-databases",
+                    "List PostgreSQL databases visible to the configured connection",
+                    "observe",
+                    "read_only",
+                    step_risk="low",
+                    tool_policy="read_only_tools",
+                    expected_tools=["postgres_read"],
+                    evidence_required=evidence or ["database_list"],
+                    criteria=["Visible databases are collected from PostgreSQL catalogs or the unavailable source is explained"],
+                ),
+                step(
+                    "report-databases",
+                    "Report visible databases and the current connected database",
+                    "report",
+                    "documentation",
+                    ["list-databases"],
+                    criteria=["Answer lists visible databases and identifies the current database"],
+                ),
+            ]
+        return [
+            step(
+                "collect-readonly-evidence",
+                f"Collect read-only PostgreSQL evidence for: {goal}",
+                "observe",
+                "diagnostic",
+                step_risk="low",
+                tool_policy="read_only_tools",
+                expected_tools=[
+                    "postgres_read",
+                    "postgres_connection_check",
+                    "postgres_health_check",
+                    "postgres_top_queries",
+                    "postgres_lock_inspect",
+                    "postgres_list_schemas",
+                ],
+                evidence_required=evidence or ["connection_info", "health_check", "schema_summary"],
+                criteria=["Requested read-only database evidence is available, or unavailable checks are explained"],
+            ),
+            step(
+                "analyze-readonly-evidence",
+                "Analyze the collected PostgreSQL evidence and identify notable findings",
+                "diagnose",
+                "diagnostic",
+                ["collect-readonly-evidence"],
+                criteria=["Findings are explained with evidence and limitations"],
+            ),
+            step(
+                "report-readonly-findings",
+                "Report read-only findings, risks, and recommended next steps",
+                "report",
+                "documentation",
+                ["analyze-readonly-evidence"],
+                criteria=["Report includes evidence, assumptions, limitations, and next steps"],
             ),
         ]
 
@@ -559,6 +673,69 @@ def _workflow_default_steps(state: AgentState) -> list[dict[str, Any]]:
     ]
 
 
+def _is_top_query_request(goal_text: str) -> bool:
+    return bool(
+        re.search(r"\b(slowest|slow\s+sql|top\s+queries|top\s+query|pg_stat_statements)\b", goal_text, re.IGNORECASE)
+        or any(
+            token in goal_text
+            for token in (
+                "最慢",
+                "慢sql",
+                "慢 sql",
+                "慢查询",
+                "执行较慢",
+                "执行过的最慢",
+                "最需要优化的sql",
+                "最需要优化的 sql",
+                "需要优化的sql",
+                "需要优化的 sql",
+            )
+        )
+    )
+
+
+def _top_query_default_steps(evidence: list[str] | None = None) -> list[dict[str, Any]]:
+    evidence = [
+        item
+        for item in list(evidence or [])
+        if item in {"top_queries", "active_queries", "connection_info"}
+    ]
+    return [
+        {
+            "id": "collect-top-queries",
+            "description": "Collect read-only PostgreSQL top query evidence from configured statistics and current activity",
+            "dependencies": [],
+            "status": "pending",
+            "phase": "observe",
+            "operation_type": "diagnostic",
+            "risk_level": "low",
+            "requires_approval": False,
+            "requires_rollback_plan": False,
+            "evidence_required": list(dict.fromkeys([*evidence, "top_queries", "active_queries", "connection_info"])),
+            "success_criteria": [
+                "Top queries are collected from available PostgreSQL statistics, or the unavailable source is clearly explained"
+            ],
+            "expected_tools": ["postgres_connection_check", "postgres_top_queries", "postgres_lock_inspect"],
+            "tool_policy": "read_only_tools",
+        },
+        {
+            "id": "report-optimization-targets",
+            "description": "Rank the queries that most need optimization and explain the evidence, limits, and next steps",
+            "dependencies": ["collect-top-queries"],
+            "status": "pending",
+            "phase": "report",
+            "operation_type": "documentation",
+            "risk_level": "low",
+            "requires_approval": False,
+            "requires_rollback_plan": False,
+            "evidence_required": [],
+            "success_criteria": ["Answer identifies the highest-priority SQL candidates with evidence and caveats"],
+            "expected_tools": [],
+            "tool_policy": "no_tools",
+        },
+    ]
+
+
 def _normalize_task(raw: dict[str, Any], index: int, intent: dict[str, Any] | None) -> TaskStep:
     operation = _enum(raw.get("operation_type"), OPERATION_TYPES, "none")
     phase = _enum(raw.get("phase"), PHASES, "execute" if operation in WRITE_OPERATION_TYPES else "observe")
@@ -666,6 +843,16 @@ def validate_and_normalize_plan(tasks_raw: list[dict[str, Any]], state: AgentSta
     tasks = [_normalize_task(task, idx, intent) for idx, task in enumerate(tasks_raw)]
     _ensure_unique_ids(tasks)
     _fix_dependencies(tasks)
+    goal_text = f"{intent.get('goal') or ''} {intent.get('user_language_summary') or ''}".lower()
+    is_table_listing = bool(
+        re.search(r"\b(tables?|relations?)\b", goal_text, re.IGNORECASE)
+        or any(token in goal_text for token in ("有哪些表", "列出表", "查看表", "表清单", "所有表"))
+    )
+    is_slow_sql = _should_force_top_query_path(intent, goal_text)
+    if is_slow_sql:
+        tasks = [_normalize_task(task, idx, intent) for idx, task in enumerate(_top_query_default_steps(intent.get("evidence_needed")))]
+        _ensure_unique_ids(tasks)
+        _fix_dependencies(tasks)
 
     read_only_constrained = any(
         "只读" in constraint.lower() or "read-only" in constraint.lower() or "read only" in constraint.lower()
@@ -690,6 +877,41 @@ def validate_and_normalize_plan(tasks_raw: list[dict[str, Any]], state: AgentSta
 
         if not task.get("success_criteria"):
             task["success_criteria"] = ["Step objective is completed and result is recorded"]
+
+    if is_table_listing:
+        observe = next((task for task in tasks if task.get("phase") == "observe"), tasks[0] if tasks else None)
+        if observe:
+            expected = list(dict.fromkeys([*observe.get("expected_tools", []), "postgres_list_schemas", "postgres_list_objects"]))
+            criteria = list(
+                dict.fromkeys(
+                    [
+                        *observe.get("success_criteria", []),
+                        "User table list is collected from PostgreSQL catalogs or the unavailable source is explained",
+                    ]
+                )
+            )
+            evidence_required = list(dict.fromkeys([*observe.get("evidence_required", []), "schema_summary"]))
+            observe["operation_type"] = "read_only"
+            observe["tool_policy"] = "read_only_tools"
+            observe["expected_tools"] = expected
+            observe["success_criteria"] = criteria
+            observe["evidence_required"] = evidence_required
+
+    if is_slow_sql:
+        observe = next((task for task in tasks if task.get("phase") == "observe"), tasks[0] if tasks else None)
+        if observe:
+            observe["operation_type"] = "diagnostic"
+            observe["tool_policy"] = "read_only_tools"
+            observe["expected_tools"] = list(dict.fromkeys([*observe.get("expected_tools", []), "postgres_top_queries"]))
+            observe["evidence_required"] = list(dict.fromkeys([*observe.get("evidence_required", []), "top_queries"]))
+            observe["success_criteria"] = list(
+                dict.fromkeys(
+                    [
+                        *observe.get("success_criteria", []),
+                        "Slowest queries are collected from available PostgreSQL statistics or the unavailable source is explained",
+                    ]
+                )
+            )
 
     if not read_only_constrained:
         _insert_approval_before_execute(tasks, intent)

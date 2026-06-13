@@ -2,9 +2,9 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="zuixiaoagent",
+    name="minidb-agent",
     version="0.1.0",
-    description="Terminal-operating programming intelligent agent based on LangChain ecosystem",
+    description="MiniDB Agent: PostgreSQL management agent based on LangGraph",
     packages=find_packages(),
     python_requires=">=3.11",
     install_requires=[
@@ -17,4 +17,9 @@ setup(
         "pglast>=6.0",
         "langsmith>=0.2.0",
     ],
+    entry_points={
+        "console_scripts": [
+            "minidb-agent=cli.main:sync_main",
+        ],
+    },
 )

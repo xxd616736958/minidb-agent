@@ -97,6 +97,7 @@ def test_database_environment_profile_is_safe_and_production_aware(monkeypatch):
     assert profile["environment_name"] == "production"
     assert profile["is_production"] is True
     assert profile["safe_host_label"] == "prod.example.com"
+    assert profile["safe_port"] == 5432
     assert profile["safe_user_label"] == "user"
     assert "secret" not in str(profile)
 

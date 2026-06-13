@@ -29,17 +29,7 @@ console = Console()
 
 def print_banner():
     """Print the CLI welcome banner."""
-    banner = Text()
-    banner.append("╔══════════════════════════════════════════════════════╗\n", style="bold blue")
-    banner.append("║", style="bold blue")
-    banner.append("  🖥️  mini db agent — PostgreSQL Agent          ", style="bold white")
-    banner.append("║\n", style="bold blue")
-    banner.append("║", style="bold blue")
-    banner.append("  LangGraph • PostgreSQL • Safety Gates        ", style="dim cyan")
-    banner.append("║\n", style="bold blue")
-    banner.append("╚══════════════════════════════════════════════════════╝", style="bold blue")
-    console.print(banner)
-    console.print()
+    console.print("[bold cyan]MiniDB Agent[/bold cyan] [dim]PostgreSQL assistant[/dim]")
 
 
 def print_streaming(text: str):
@@ -117,6 +107,7 @@ def print_connection_card(card: dict[str, Any]):
     table.add_row("Host", f"{card.get('host', 'unknown')}:{card.get('port', '5432')}")
     table.add_row("Database", str(card.get("database") or "unknown"))
     table.add_row("User", str(card.get("user") or "unknown"))
+    table.add_row("Source", str(card.get("source") or "cli"))
     table.add_row("Readonly", "yes" if card.get("readonly") else "no")
     table.add_row("Approval", str(card.get("approval_mode") or "unknown"))
     table.add_row("Fingerprint", str(card.get("fingerprint") or "unknown"))
@@ -127,10 +118,30 @@ def print_connection_card(card: dict[str, Any]):
     console.print()
 
 
-def print_cli_event(event: dict[str, Any]):
+def print_connection_summary(card: dict[str, Any]):
+    """Display one-line PostgreSQL target metadata for normal startup."""
+    if not card:
+        return
+    env = str(card.get("target_environment") or "unknown")
+    host = f"{card.get('host', 'unknown')}:{card.get('port', '5432')}"
+    database = str(card.get("database") or "unknown")
+    user = str(card.get("user") or "unknown")
+    approval = str(card.get("approval_mode") or "unknown")
+    readonly = "readonly" if card.get("readonly") else "write after approval"
+    source = str(card.get("source") or "cli")
+    style = "red" if env in {"prod", "production"} else "yellow" if env == "unknown" else "cyan"
+    console.print(
+        f"[dim]Target:[/dim] [{style}]{env}/{database}[/] "
+        f"[dim]@ {host} as {user}; source={source}; {readonly}; approval={approval}[/dim]"
+    )
+
+
+def print_cli_event(event: dict[str, Any], *, verbose: bool = False):
     """Render a stable database-task event."""
     event_type = str(event.get("type") or "event")
     summary = str(event.get("summary") or "")[:180]
+    if not verbose and event_type not in {"approval_required", "blocked"}:
+        return
     style = {
         "task_understanding": "cyan",
         "plan_ready": "blue",
@@ -144,6 +155,32 @@ def print_cli_event(event: dict[str, Any]):
         "error": "red",
     }.get(event_type, "dim")
     console.print(f"[{style}]{event_type}[/] {summary}")
+
+
+def print_agent_status(summary: str) -> None:
+    """Display a Codex-style compact status line."""
+    if summary:
+        console.print(f"[dim]{summary}[/dim]")
+
+
+def print_tool_start(label: str) -> None:
+    """Display a Codex-style active tool line."""
+    console.print(f"[dim]•[/dim] [bold]Running[/bold] {label}")
+
+
+def print_tool_done(label: str, summary: str | None = None, *, success: bool = True) -> None:
+    """Display a Codex-style completed tool block."""
+    bullet_style = "green" if success else "red"
+    verb = "Ran" if success else "Failed"
+    console.print(f"[{bullet_style}]•[/] [bold]{verb}[/bold] {label}")
+    if summary:
+        lines = str(summary).splitlines() or [str(summary)]
+        first, rest = lines[0], lines[1:]
+        console.print(f"[dim]  └ {first[:220]}[/dim]")
+        for line in rest[:4]:
+            console.print(f"[dim]    {line[:220]}[/dim]")
+        if len(rest) > 4:
+            console.print(f"[dim]    … +{len(rest) - 4} lines (ctrl + t to view transcript)[/dim]")
 
 
 def print_doctor_report(report: dict[str, Any]):
@@ -703,14 +740,8 @@ def _print_delivery(payload: dict[str, Any]) -> None:
 
 def print_session_info(session_id: str, model: str, tools_count: int):
     """Display session information."""
-    table = Table(show_header=False, box=None, padding=(0, 4))
-    table.add_column(style="dim")
-    table.add_column(style="cyan")
-    table.add_row("Session:", session_id[:8] + "..." if len(session_id) > 12 else session_id)
-    table.add_row("Model:", model)
-    table.add_row("Tools:", str(tools_count))
-    console.print(table)
-    console.print()
+    short = session_id[:8] + "..." if len(session_id) > 12 else session_id
+    console.print(f"[dim]Session:[/dim] [cyan]{short}[/cyan] [dim]model={model} tools={tools_count}[/dim]")
 
 
 def print_divider():

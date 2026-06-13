@@ -103,7 +103,7 @@ class AgentSettings(BaseSettings):
         default="", alias="LANGSMITH_API_KEY",
     )
     langsmith_project: str = Field(
-        default="zuixiaoagent", alias="LANGSMITH_PROJECT",
+        default="minidb-agent", alias="LANGSMITH_PROJECT",
     )
     langsmith_endpoint: str = Field(
         default="https://api.smith.langchain.com", alias="LANGSMITH_ENDPOINT",

@@ -52,6 +52,14 @@ def sensitivity_rank(value: str | None) -> int:
     return {"public": 1, "internal": 2, "sensitive": 3, "secret": 4}.get(str(value or "internal"), 2)
 
 
+def is_write_sql_item(item: dict[str, Any]) -> bool:
+    return (
+        item.get("classification") in WRITE_CLASSIFICATIONS
+        or item.get("purpose") in {"change", "rollback"}
+        or item.get("status") in {"approved", "executed", "blocked"}
+    )
+
+
 class DeliveryManager:
     """Build auditable delivery contracts, manifests, reports, and packages."""
 
@@ -84,7 +92,7 @@ class DeliveryManager:
             required_items.extend(["sql_change_package", "approval_package", "rollback_package", "verification_report"])
             required_evidence.extend(["sql_safety_report", "approval", "verification"])
             delivery_mode = "approval_package" if requires_approval else "audit_package"
-        if self.state.get("loop_status") == "blocked" or self.state.get("error_reports"):
+        if self.state.get("loop_status") == "blocked" or self._has_blocking_error_reports():
             required_items.append("blocked_report")
         if not required_evidence and intent.get("domain") == "postgresql":
             required_evidence.append("db_observation")
@@ -204,11 +212,13 @@ class DeliveryManager:
         plan = self.state.get("db_task_plan") or {}
         evidence_ids = [ref["id"] for ref in manifest["evidence_refs"][:12]]
         missing = manifest.get("missing_items", [])
+        assistant_report = self._assistant_report_text()
+        summary = compact(plan.get("summary") or intent.get("goal") or "Task delivery package generated.", 900)
         sections = [
             self._section(
                 "summary",
                 "摘要",
-                compact(plan.get("summary") or intent.get("goal") or "Task delivery package generated.", 900),
+                summary,
                 evidence_ids[:3],
                 "complete" if intent or plan else "missing_evidence",
             ),
@@ -241,6 +251,29 @@ class DeliveryManager:
                 "complete",
             ),
         ]
+        if assistant_report:
+            sections.insert(
+                1,
+                self._section(
+                    "assistant_report",
+                    "助手结论",
+                    assistant_report,
+                    evidence_ids,
+                    "complete",
+                ),
+            )
+        findings = self._findings_section()
+        if findings:
+            sections.insert(
+                1,
+                self._section(
+                    "findings",
+                    "主要发现",
+                    findings,
+                    [ref["id"] for ref in manifest["evidence_refs"] if ref["source_type"] in {"db_observation", "tool_result"}][:8],
+                    "complete",
+                ),
+            )
         if contract["requires_sql_package"] or manifest["sql_items"]:
             sections.insert(
                 2,
@@ -257,7 +290,7 @@ class DeliveryManager:
                 1,
                 self._section(
                     "diagnosis",
-                    "阻塞或失败说明",
+                    "恢复或阻塞说明",
                     self._blocked_section(),
                     [ref["id"] for ref in manifest["evidence_refs"] if ref["source_type"] == "error_report"],
                     "complete",
@@ -291,12 +324,14 @@ class DeliveryManager:
         else:
             passed.append("required_evidence_present")
         sql_items = manifest.get("sql_items", [])
-        unsafe_sql = [item for item in sql_items if not item.get("sql_hash") or not item.get("safety_report_id")]
-        (failed if unsafe_sql else passed).append("sql_items_have_safety_metadata")
-        write_without_approval = [
-            item for item in sql_items
-            if item.get("classification") in WRITE_CLASSIFICATIONS and not item.get("approval_id")
+        write_sql_items = [item for item in sql_items if is_write_sql_item(item)]
+        unsafe_sql = [
+            item
+            for item in sql_items
+            if not item.get("sql_hash") or (is_write_sql_item(item) and not item.get("safety_report_id"))
         ]
+        (failed if unsafe_sql else passed).append("sql_items_have_safety_metadata")
+        write_without_approval = [item for item in write_sql_items if not item.get("approval_id")]
         (failed if write_without_approval and contract.get("requires_approval_evidence") else passed).append("write_items_have_approval")
         rollback_ok = not contract.get("requires_rollback_plan") or any((approval.get("rollback_summary") for approval in self.state.get("approval_decisions", [])))
         (passed if rollback_ok else failed).append("rollback_present_when_required")
@@ -319,6 +354,9 @@ class DeliveryManager:
         manager = DeliveryManager(delivery_state)
         contract = manager.build_contract()
         manifest = manager.build_manifest()
+        gate = manager.delivery_quality_gate(contract, manifest, report_paths=["pending"])
+        status = manager._delivery_status(force_blocked=force_blocked, gate=gate)
+        contract = {**contract, "status": "blocked" if status in {"blocked", "failed"} else "ready", "updated_at": now_iso()}
         sections = manager.report_sections(contract, manifest)
         report_paths, report_artifacts = manager.write_reports(contract, manifest, sections)
         manifest = {**manifest, "report_paths": [*manifest.get("report_paths", []), *report_paths]}
@@ -327,9 +365,15 @@ class DeliveryManager:
         Path(manifest_path).write_text(json.dumps(manifest, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         report_paths = [*report_paths, manifest_path]
         gate = manager.delivery_quality_gate(contract, manifest, report_paths=report_paths)
-        status = "blocked" if force_blocked or gate["status"] == "failed" or delivery_state.get("loop_status") == "blocked" else "ready"
-        package = manager.delivery_package(contract, manifest, gate, report_paths, [*report_artifacts, manifest_artifact], status=status)
+        status = manager._delivery_status(force_blocked=force_blocked, gate=gate)
         contract = {**contract, "status": "blocked" if status in {"blocked", "failed"} else "ready", "updated_at": now_iso()}
+        # Rewrite user/audit reports after the final quality gate because status
+        # and report paths are only known after artifact generation.
+        if report_paths:
+            Path(report_paths[0]).write_text(manager.render_user_report(contract, manifest, sections), encoding="utf-8")
+        if len(report_paths) > 1:
+            Path(report_paths[1]).write_text(manager.render_audit_report(contract, manifest, sections), encoding="utf-8")
+        package = manager.delivery_package(contract, manifest, gate, report_paths, [*report_artifacts, manifest_artifact], status=status)
         task_workspace = manager._task_workspace()
         if task_workspace:
             task_workspace = dict(task_workspace)
@@ -352,6 +396,15 @@ class DeliveryManager:
             "quality_gates": [gate],
             "artifact_records": [*report_artifacts, manifest_artifact],
         }
+
+    def _delivery_status(self, *, force_blocked: bool, gate: QualityGate) -> str:
+        if force_blocked or gate["status"] == "failed":
+            return "blocked"
+        runtime = self.state.get("db_task_runtime") or {}
+        task_status = str(runtime.get("task_status") or self.state.get("loop_status") or "")
+        if self._has_blocking_error_reports() or task_status in {"blocked", "failed", "error"}:
+            return "blocked"
+        return "ready"
 
     def write_reports(
         self,
@@ -430,7 +483,7 @@ class DeliveryManager:
             "",
         ]
         for section in sections:
-            if section["purpose"] in {"summary", "diagnosis", "evidence", "risk", "verification", "next_steps"}:
+            if section["purpose"] in {"summary", "assistant_report", "findings", "diagnosis", "evidence", "execution", "risk", "verification", "next_steps"}:
                 lines.extend([f"## {section['title']}", "", section["content"] or "No content.", ""])
         return "\n".join(lines).strip() + "\n"
 
@@ -454,7 +507,7 @@ class DeliveryManager:
             actions.append("approve_execution")
         if contract.get("requires_verification") and not self.state.get("verification_results"):
             actions.append("run_verification")
-        if self.state.get("loop_status") == "blocked" or self.state.get("error_reports"):
+        if self.state.get("loop_status") == "blocked" or self._has_blocking_error_reports():
             actions.extend(["report_only", "adjust_task_scope"])
         actions.append("export_audit_package")
         return list(dict.fromkeys(actions))
@@ -494,14 +547,21 @@ class DeliveryManager:
         max_value = max((sensitivity_rank(value) for value in values), default=2)
         return {1: "public", 2: "internal", 3: "sensitive", 4: "secret"}[max_value]
 
+    def _has_blocking_error_reports(self) -> bool:
+        return any(
+            report.get("status") in {"failed", "blocked"}
+            for report in self.state.get("error_reports", []) or []
+        )
+
     def _missing_manifest_items(self, evidence_refs: list[EvidenceReference], sql_items: list[SQLDeliveryItem]) -> list[str]:
         contract = self.state.get("active_delivery_contract") or self.build_contract()
         missing: list[str] = []
+        write_sql_items = [item for item in sql_items if is_write_sql_item(item)]
         if contract.get("required_evidence_types") and not evidence_refs:
             missing.append("required_evidence")
         if contract.get("requires_sql_package") and not sql_items:
             missing.append("sql_change_package")
-        if contract.get("requires_approval_evidence") and not any(item.get("approval_id") for item in sql_items):
+        if contract.get("requires_approval_evidence") and write_sql_items and not any(item.get("approval_id") for item in write_sql_items):
             missing.append("approval_package")
         if contract.get("requires_verification") and not self.state.get("verification_results"):
             missing.append("verification_report")
@@ -546,6 +606,173 @@ class DeliveryManager:
             for ref in manifest["evidence_refs"][:12]
         )
 
+    def _assistant_report_text(self) -> str:
+        for message in reversed(self.state.get("messages", []) or []):
+            if isinstance(message, dict):
+                msg_type = str(message.get("type") or message.get("role") or "")
+            else:
+                msg_type = str(getattr(message, "type", "") or getattr(message, "role", ""))
+            if msg_type in {"system", "tool", "function"}:
+                continue
+            tool_calls = message.get("tool_calls") if isinstance(message, dict) else getattr(message, "tool_calls", None)
+            if tool_calls:
+                continue
+            content = message.get("content") if isinstance(message, dict) else getattr(message, "content", "")
+            text = re.sub(r"\n{4,}", "\n\n\n", str(content or "").strip())[:4000]
+            if text and not text.startswith("{") and not self._is_internal_control_text(text):
+                return text
+        return ""
+
+    @staticmethod
+    def _is_internal_control_text(text: str) -> bool:
+        lowered = text.lower()
+        markers = (
+            "does not allow additional tool calls",
+            "blocked tools:",
+            "continue using the evidence already collected",
+            "current report step",
+            "current propose step",
+        )
+        return any(marker in lowered for marker in markers)
+
+    def _findings_section(self) -> str:
+        observations = self.state.get("db_observations", []) or []
+        top_queries = [
+            obs
+            for obs in observations
+            if obs.get("type") == "top_queries" and isinstance(obs.get("payload"), dict)
+        ]
+        if top_queries:
+            return self._top_queries_findings(top_queries[-1])
+
+        connection = next(
+            (
+                obs
+                for obs in reversed(observations)
+                if obs.get("type") == "connection_status" and isinstance(obs.get("payload"), dict)
+            ),
+            None,
+        )
+        if connection:
+            payload = connection.get("payload") or {}
+            lines = [
+                "- PostgreSQL connection is available.",
+                f"- Database: {compact(payload.get('database'), 120) or 'unknown'}",
+                f"- User: {compact(payload.get('user'), 120) or 'unknown'}",
+            ]
+            if payload.get("version"):
+                lines.append(f"- Version: {compact(payload.get('version'), 240)}")
+            return "\n".join(lines)
+
+        summaries = [compact(obs.get("summary"), 240) for obs in observations if obs.get("summary")]
+        if summaries:
+            return "\n".join(f"- {item}" for item in summaries[:8])
+        return ""
+
+    def _top_queries_findings(self, observation: dict[str, Any]) -> str:
+        payload = observation.get("payload") or {}
+        queries = [item for item in payload.get("queries", []) if isinstance(item, dict)]
+        if not queries:
+            if payload.get("history_available") is False:
+                return "- pg_stat_statements/history source is not available; no historical slow SQL evidence was collected."
+            return "- No top query rows were returned by the configured PostgreSQL statistics source."
+
+        sort_by = compact(payload.get("sort_by"), 80) or "resources"
+        candidate = self._primary_query_candidate(queries)
+        lines = [
+            f"- Data source: {observation.get('source_tool') or 'postgres statistics'}",
+            f"- Sort rule selected by agent: {sort_by}",
+            f"- Rows collected: {len(queries)}",
+        ]
+        if payload.get("history_available") is False:
+            lines.append("- Historical statistics were not available; results may come from current activity only.")
+
+        if candidate:
+            preview = compact(candidate.get("query_preview"), 320)
+            lines.extend(
+                [
+                    "",
+                    "### 优先优化对象",
+                    f"- SQL type: {self._sql_verb(preview)}",
+                    f"- Calls: {self._fmt_number(candidate.get('calls'))}",
+                    f"- Total time: {self._fmt_ms(candidate.get('total_exec_time'))}",
+                    f"- Mean time: {self._fmt_ms(candidate.get('mean_exec_time'))}",
+                    f"- Shared blocks read: {self._fmt_number(candidate.get('shared_blks_read'))}",
+                    f"- Temp blocks: read={self._fmt_number(candidate.get('temp_blks_read'))}, written={self._fmt_number(candidate.get('temp_blks_written'))}",
+                    f"- SQL preview: `{preview}`",
+                    f"- Suggested next step: {self._optimization_hint(candidate)}",
+                ]
+            )
+
+        lines.extend(["", "### Top SQL Evidence"])
+        for index, query in enumerate(queries[:10], start=1):
+            preview = compact(query.get("query_preview"), 260)
+            lines.append(
+                f"{index}. `{self._sql_verb(preview)}` "
+                f"calls={self._fmt_number(query.get('calls'))} "
+                f"total={self._fmt_ms(query.get('total_exec_time'))} "
+                f"mean={self._fmt_ms(query.get('mean_exec_time'))} "
+                f"rows={self._fmt_number(query.get('rows'))} "
+                f"reads={self._fmt_number(query.get('shared_blks_read'))} "
+                f"temp={self._fmt_number(query.get('temp_blks_written'))}"
+            )
+            lines.append(f"   SQL: `{preview}`")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _primary_query_candidate(queries: list[dict[str, Any]]) -> dict[str, Any] | None:
+        read_candidates = [
+            query
+            for query in queries
+            if DeliveryManager._sql_verb(query.get("query_preview")) in {"SELECT", "WITH"}
+        ]
+        return (read_candidates or queries)[0] if queries else None
+
+    @staticmethod
+    def _sql_verb(sql: Any) -> str:
+        text = str(sql or "").lstrip(" (").upper()
+        match = re.match(r"([A-Z]+)", text)
+        return match.group(1) if match else "SQL"
+
+    @staticmethod
+    def _fmt_number(value: Any) -> str:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "unknown"
+        if number.is_integer():
+            return f"{int(number):,}"
+        return f"{number:,.2f}"
+
+    @staticmethod
+    def _fmt_ms(value: Any) -> str:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "unknown"
+        if number >= 1000:
+            return f"{number / 1000:.2f}s"
+        return f"{number:.2f}ms"
+
+    @staticmethod
+    def _optimization_hint(query: dict[str, Any]) -> str:
+        preview = str(query.get("query_preview") or "")
+        lowered = preview.lower()
+        verb = DeliveryManager._sql_verb(preview)
+        reads = float(query.get("shared_blks_read") or 0)
+        temp_written = float(query.get("temp_blks_written") or 0)
+        if verb in {"INSERT", "UPDATE", "DELETE", "MERGE"}:
+            return "treat this as a write-path tuning target; inspect batch size, index maintenance cost, constraints, WAL pressure, and transaction shape before changing schema."
+        if "count(distinct" in lowered or " group by " in lowered:
+            return "this is an aggregate/grouping workload; inspect EXPLAIN (ANALYZE, BUFFERS), grouping keys, sort/hash memory pressure, temporary spill, and whether a covering index, partial index, pre-aggregation, or materialized summary fits the workload."
+        if "count(*)" in lowered and " where " not in lowered:
+            return "this is an exact full-table count pattern; a normal btree index usually cannot make it constant-time, so verify whether approximate counts, cached summaries, or a materialized aggregate fit the business requirement."
+        if temp_written > 0:
+            return "run EXPLAIN (ANALYZE, BUFFERS) for the statement and check sort/hash memory pressure, work_mem, joins, and indexes that can reduce temporary spill."
+        if reads > 0:
+            return "run EXPLAIN (ANALYZE, BUFFERS), identify scan/join predicates, then evaluate a targeted index or query rewrite against the measured plan."
+        return "collect EXPLAIN (ANALYZE, BUFFERS) and object/index details before proposing a write change."
+
     def _risk_section(self, manifest: ArtifactManifest) -> str:
         runtime = self.state.get("db_task_runtime") or {}
         lines = [
@@ -578,7 +805,10 @@ class DeliveryManager:
     def _blocked_section(self) -> str:
         reports = self.state.get("error_reports", [])
         if reports:
-            return "\n".join(f"- {compact(item.get('user_summary'), 300)}" for item in reports[-3:])
+            return "\n".join(
+                f"- {item.get('status') or 'unknown'}: {compact(item.get('user_summary'), 300)}"
+                for item in reports[-3:]
+            )
         violation = self.state.get("policy_violation") or {}
         if violation:
             return f"- {compact(violation.get('message'), 400)}"

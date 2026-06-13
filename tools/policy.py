@@ -40,7 +40,41 @@ def now_iso() -> str:
 
 
 def tool_call_items(msg: Any) -> list[dict[str, Any]]:
-    return list(getattr(msg, "tool_calls", None) or [])
+    """Return normalized tool calls from LangChain objects or serialized dicts.
+
+    Codex and Claude treat tool calls as protocol events instead of binding
+    the state machine to one in-memory message type. LangGraph stores local
+    messages as objects, while server checkpoints may expose plain dicts or
+    provider-native OpenAI-compatible ``additional_kwargs.tool_calls``. Normalize
+    those shapes before policy/execution routing.
+    """
+    if isinstance(msg, dict):
+        raw_calls = msg.get("tool_calls") or (msg.get("additional_kwargs") or {}).get("tool_calls") or []
+    else:
+        raw_calls = getattr(msg, "tool_calls", None) or []
+
+    calls: list[dict[str, Any]] = []
+    for index, raw in enumerate(raw_calls):
+        if not isinstance(raw, dict):
+            continue
+        function = raw.get("function") if isinstance(raw.get("function"), dict) else {}
+        name = raw.get("name") or function.get("name")
+        args = raw.get("args")
+        if args is None:
+            args = raw.get("arguments") or function.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {"input": args}
+        if args is None:
+            args = {}
+        if not isinstance(args, dict):
+            args = {"input": args}
+        call_id = raw.get("id") or raw.get("tool_call_id") or raw.get("call_id") or f"call-{index}"
+        if name:
+            calls.append({"name": str(name), "args": args, "id": str(call_id)})
+    return calls
 
 
 def tool_args_text(tool_call: dict[str, Any]) -> str:

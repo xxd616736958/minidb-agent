@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 
 from agent.context import (
     build_context_snapshot,
@@ -176,6 +176,26 @@ def _pending_approval_from_blocked_decision(
     }
 
 
+def _can_continue_no_tools_step(current_step: TaskStep | None) -> bool:
+    if not current_step:
+        return False
+    phase = str(current_step.get("phase") or "")
+    operation = str(current_step.get("operation_type") or "")
+    return phase in {"propose", "report", "approve", "clarify"} or operation == "documentation"
+
+
+def _clear_message_tool_calls(message: Any) -> None:
+    """Clear tool calls in object or serialized message shapes in-place."""
+    if isinstance(message, dict):
+        message["tool_calls"] = []
+        additional = message.get("additional_kwargs")
+        if isinstance(additional, dict):
+            additional.pop("tool_calls", None)
+        return
+    if hasattr(message, "tool_calls"):
+        message.tool_calls = []
+
+
 def tool_policy_gate(state: AgentState) -> dict[str, Any]:
     """Enforce the current step's tool policy before execution."""
     messages = state.get("messages", [])
@@ -244,8 +264,68 @@ def tool_policy_gate(state: AgentState) -> dict[str, Any]:
 
     logger.warning("Tool policy violation: %s", violation)
 
-    if hasattr(last_msg, "tool_calls"):
-        last_msg.tool_calls = []
+    if pending_approval:
+        result = {
+            "policy_violation": None,
+            "tool_policy_decisions": decisions,
+            "security_policy_decisions": security_decisions,
+            "sql_safety_reports": sql_reports,
+            "approval_bindings": approval_bindings,
+            "safety_audit_records": safety_audit_records,
+            "tool_invocation_records": records,
+            "step_context": packet,
+            "output_safety_policy": safety_engine.default_output_policy(),
+            **environment_update,
+            "loop_status": "waiting_for_approval",
+            "pending_approval": pending_approval,
+            "approval_decisions": [pending_approval],
+        }
+        approval_update = CollaborationManager({**policy_state, **result}).approval_card_update(pending_approval)
+        result["approval_card"] = approval_update["approval_card"]
+        result["collaboration_events"] = [*tool_events, *approval_update["collaboration_events"]]
+        waiting_state = {
+            **policy_state,
+            **environment_update,
+            **{
+                "loop_status": "waiting_for_approval",
+                "pending_approval": pending_approval,
+                "approval_card": result.get("approval_card"),
+                "policy_violation": None,
+            },
+        }
+        result.update(StateManager(waiting_state).runtime_update(last_node="tool_policy_gate"))
+        result.update(StateValidator(waiting_state).validation_update())
+        return result
+
+    if policy == "no_tools" and _can_continue_no_tools_step(current_step):
+        _clear_message_tool_calls(last_msg)
+        tool_names = [str(call.get("name", "unknown")) for call in tool_calls]
+        content = (
+            f"The current {current_step.get('phase') or 'planned'} step does not allow additional tool calls.\n"
+            f"Blocked tools: {', '.join(tool_names)}\n"
+            "Continue using the evidence already collected in structured observations and tool results. "
+            "If evidence is insufficient, state the limitation and next safe step instead of calling another tool."
+        )
+        report_state = {**policy_state, **environment_update}
+        return {
+            "messages": [last_msg, AIMessage(content=content)],
+            "policy_violation": None,
+            "tool_policy_decisions": decisions,
+            "security_policy_decisions": security_decisions,
+            "sql_safety_reports": sql_reports,
+            "approval_bindings": approval_bindings,
+            "safety_audit_records": safety_audit_records,
+            "tool_invocation_records": records,
+            "step_context": packet,
+            "output_safety_policy": safety_engine.default_output_policy(),
+            **environment_update,
+            "loop_status": "running",
+            "collaboration_events": [*tool_events],
+            **StateManager(report_state).runtime_update(last_node="tool_policy_gate"),
+            **StateValidator(report_state).validation_update(),
+        }
+
+    _clear_message_tool_calls(last_msg)
 
     tool_names = [str(call.get("name", "unknown")) for call in tool_calls]
     content = (
@@ -272,28 +352,19 @@ def tool_policy_gate(state: AgentState) -> dict[str, Any]:
         "step_context": packet,
         "output_safety_policy": safety_engine.default_output_policy(),
         **environment_update,
-        "loop_status": "waiting_for_approval" if pending_approval else ("blocked" if policy == "write_tools_after_approval" else "running"),
+        "loop_status": "blocked" if policy == "write_tools_after_approval" else "running",
     }
-    if pending_approval:
-        result["pending_approval"] = pending_approval
-        result["approval_decisions"] = [pending_approval]
-        approval_update = CollaborationManager({**policy_state, **result}).approval_card_update(pending_approval)
-        result["approval_card"] = approval_update["approval_card"]
-        result["collaboration_events"] = [*tool_events, *approval_update["collaboration_events"]]
-    else:
-        safety_update = collaboration.safety_block_update(
-            step_id=(current_step or {}).get("id"),
-            violation=result.get("policy_violation"),
-            decisions=blocked,
-        )
-        result["collaboration_events"] = [*tool_events, *safety_update["collaboration_events"]]
+    safety_update = collaboration.safety_block_update(
+        step_id=(current_step or {}).get("id"),
+        violation=result.get("policy_violation"),
+        decisions=blocked,
+    )
+    result["collaboration_events"] = [*tool_events, *safety_update["collaboration_events"]]
     blocked_state = {
         **policy_state,
         **environment_update,
         **{
             "loop_status": result["loop_status"],
-            "pending_approval": pending_approval or policy_state.get("pending_approval"),
-            "approval_card": result.get("approval_card") or policy_state.get("approval_card"),
             "policy_violation": result.get("policy_violation"),
         },
     }
@@ -317,6 +388,234 @@ def _observation_type(name: str, content: str) -> str:
     if "error" in lowered or "exception" in lowered:
         return "sql_error" if "sql" in lowered or "postgres" in lowered else "tool_error"
     return "query_result"
+
+
+def _successful_step_observations(state: AgentState, step_id: str) -> list[DBObservation]:
+    return [
+        obs
+        for obs in state.get("db_observations", [])
+        if obs.get("step_id") == step_id and obs.get("payload", {}).get("success") is not False
+    ]
+
+
+def _successful_observations(state: AgentState) -> list[DBObservation]:
+    return [
+        obs
+        for obs in state.get("db_observations", [])
+        if obs.get("payload", {}).get("success") is not False
+    ]
+
+
+def _step_observations(state: AgentState, step_id: str) -> list[DBObservation]:
+    return [
+        obs
+        for obs in state.get("db_observations", [])
+        if obs.get("step_id") == step_id
+    ]
+
+
+def _evidence_capabilities(observations: list[DBObservation]) -> set[str]:
+    capabilities: set[str] = set()
+    for obs in observations:
+        obs_type = str(obs.get("type") or "")
+        source_tool = str(obs.get("source_tool") or "")
+        payload = obs.get("payload") or {}
+        capabilities.add(obs_type)
+        capabilities.add(source_tool)
+
+        if obs_type == "explain_plan" or source_tool == "postgres_explain" or payload.get("plan"):
+            capabilities.add("execution_plan")
+        if obs_type in {"schema_summary", "object_detail"} or source_tool in {
+            "postgres_object_detail",
+            "postgres_list_objects",
+            "postgres_list_schemas",
+        }:
+            capabilities.add("schema_summary")
+        if obs_type in {"index_summary", "object_detail"} or source_tool in {
+            "postgres_object_detail",
+            "postgres_index_advisor",
+            "postgres_hypothetical_index_test",
+        }:
+            capabilities.add("index_summary")
+        if source_tool == "postgres_top_queries" or obs_type == "top_queries":
+            capabilities.add("top_queries")
+        if obs_type == "connection_status" or source_tool == "postgres_connection_check":
+            capabilities.add("connection_status")
+        if obs_type == "query_result" or source_tool == "postgres_query_readonly":
+            capabilities.add("query_result")
+            rows = payload.get("rows")
+            if rows:
+                capabilities.add("row_count_or_statistics")
+                capabilities.add("statistics")
+    return capabilities
+
+
+def _required_evidence_satisfied(required: str, capabilities: set[str]) -> bool:
+    key = str(required or "")
+    if key in capabilities:
+        return True
+    lowered = key.lower()
+    if any(token in lowered for token in ("pg_stat", "top sql", "top query", "slow query", "高成本", "慢 sql", "慢查询")):
+        return bool({"top_queries", "postgres_top_queries"} & capabilities)
+    if "explain" in lowered or "执行计划" in key:
+        return bool({"execution_plan", "explain_plan", "postgres_explain"} & capabilities)
+    if any(token in lowered for token in ("schema", "ddl", "metadata")) or any(token in key for token in ("表结构", "元数据", "列定义")):
+        return bool({"schema_summary", "object_detail", "postgres_object_detail", "postgres_list_objects"} & capabilities)
+    if "index" in lowered or "索引" in key:
+        return bool({"index_summary", "object_detail", "postgres_object_detail", "postgres_index_advisor"} & capabilities)
+    if any(token in lowered for token in ("row count", "statistics", "statistic")) or any(token in key for token in ("行数", "统计")):
+        return bool({"row_count_or_statistics", "statistics", "query_result", "postgres_query_readonly"} & capabilities)
+    if "database" in lowered or "数据库" in key:
+        return bool({"database_list", "postgres_list_databases", "connection_status"} & capabilities)
+    aliases = {
+        "execution_plan": {"execution_plan", "explain_plan", "postgres_explain"},
+        "schema_summary": {"schema_summary", "object_detail", "postgres_object_detail", "postgres_list_objects"},
+        "index_summary": {"index_summary", "object_detail", "postgres_object_detail", "postgres_index_advisor"},
+        "row_count_or_statistics": {"row_count_or_statistics", "statistics", "query_result", "postgres_query_readonly"},
+        "active_queries": {"top_queries", "postgres_top_queries", "query_result", "postgres_query_readonly"},
+        "top_queries": {"top_queries", "postgres_top_queries"},
+        "database_list": {"database_list", "postgres_list_databases"},
+    }
+    return bool(aliases.get(key, set()) & capabilities)
+
+
+def _tool_step_map(state: AgentState) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for record in state.get("tool_invocation_records", []):
+        call_id = str(record.get("call_id") or "")
+        step_id = str(record.get("step_id") or "")
+        if call_id and step_id:
+            mapping[call_id] = step_id
+    return mapping
+
+
+def _failed_step_results(state: AgentState, step_id: str) -> list[dict[str, Any]]:
+    mapping = _tool_step_map(state)
+    results: list[dict[str, Any]] = []
+    for result in state.get("tool_execution_results", []):
+        if result.get("success") is not False:
+            continue
+        call_id = str(result.get("tool_call_id") or "")
+        if mapping and mapping.get(call_id) != step_id:
+            continue
+        results.append(result)
+    return results
+
+
+def _recoverable_read_failure(step: TaskStep, failed_results: list[dict[str, Any]]) -> bool:
+    if not failed_results:
+        return False
+    if step.get("phase") in {"execute", "approve"} or step.get("tool_policy") == "write_tools_after_approval":
+        return False
+    if step.get("operation_type") not in {"diagnostic", "read_only", "documentation", None}:
+        return False
+    recoverable_types = {"sql_error", "tool_error"}
+    recoverable_sqlstates = {"42601", "42703", "42P01", "42P07"}
+    for result in failed_results:
+        if str(result.get("result_type") or "") not in recoverable_types:
+            return False
+        sqlstate = str(result.get("sqlstate") or "")
+        if sqlstate and sqlstate not in recoverable_sqlstates:
+            return False
+    return True
+
+
+def _failure_repeat_count(state: AgentState, step_id: str, failed_results: list[dict[str, Any]]) -> int:
+    if not failed_results:
+        return 0
+    latest = failed_results[-1]
+    latest_key = (
+        str(latest.get("tool_name") or ""),
+        str(latest.get("sqlstate") or ""),
+        str(latest.get("summary") or "")[:160],
+    )
+    count = 0
+    for obs in _step_observations(state, step_id):
+        payload = obs.get("payload") or {}
+        if payload.get("success") is not False:
+            continue
+        key = (
+            str(obs.get("source_tool") or ""),
+            str(payload.get("sqlstate") or ""),
+            str(obs.get("summary") or "")[:160],
+        )
+        if key == latest_key:
+            count += 1
+    return count
+
+
+def _read_failure_repair_message(step: TaskStep, failed_results: list[dict[str, Any]]) -> SystemMessage:
+    latest = failed_results[-1]
+    content = (
+        "A read-only PostgreSQL diagnostic tool failed while the current step is still recoverable.\n"
+        f"- step_id: {step.get('id')}\n"
+        f"- tool_name: {latest.get('tool_name')}\n"
+        f"- sqlstate: {latest.get('sqlstate') or 'unknown'}\n"
+        f"- error: {latest.get('summary')}\n\n"
+        "Continue the same user task by correcting the read-only SQL or choosing a safer structured PostgreSQL tool. "
+        "Do not repeat the same failing SQL. If a PostgreSQL catalog/view column is uncertain, inspect the catalog or use "
+        "structured object/detail tools before querying it."
+    )
+    return SystemMessage(content=content)
+
+
+def _latest_assistant_text(state: AgentState) -> str:
+    for message in reversed(state.get("messages", []) or []):
+        role = message.get("role") if isinstance(message, dict) else getattr(message, "type", "")
+        if role not in {"ai", "assistant"} and not isinstance(message, AIMessage):
+            continue
+        if isinstance(message, ToolMessage):
+            continue
+        tool_calls = message.get("tool_calls") if isinstance(message, dict) else getattr(message, "tool_calls", None)
+        if tool_calls:
+            continue
+        content = message.get("content", "") if isinstance(message, dict) else getattr(message, "content", "")
+        text = str(content or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _step_has_expected_evidence(state: AgentState, step: TaskStep, observations: list[DBObservation]) -> tuple[bool, str]:
+    expected_tools = {str(tool) for tool in step.get("expected_tools", []) if tool}
+    evidence_required = {str(item) for item in step.get("evidence_required", []) if item}
+
+    if step.get("phase") == "report" and not _latest_assistant_text(state):
+        return False, "Waiting for assistant report content before completing the report step."
+
+    if step.get("tool_policy") == "read_only_tools" and (expected_tools or evidence_required) and not observations:
+        return False, "Waiting for read-only tool evidence before completing the step."
+
+    source_tools = {str(obs.get("source_tool") or "") for obs in observations}
+    observation_types = {str(obs.get("type") or "") for obs in observations}
+    capabilities = _evidence_capabilities(observations)
+
+    if "postgres_list_objects" in expected_tools and "postgres_list_objects" not in source_tools:
+        return False, "Table/object listing has not been collected yet."
+    if "postgres_top_queries" in expected_tools and not (
+        "postgres_top_queries" in source_tools or "top_queries" in observation_types
+    ):
+        return False, "Top/slow query evidence has not been collected yet."
+
+    if "schema_summary" in evidence_required and (
+        expected_tools
+        & {"postgres_list_objects", "postgres_list_schemas", "postgres_object_detail", "postgres_read"}
+    ) and not _required_evidence_satisfied("schema_summary", capabilities):
+        return False, "Schema evidence has not been collected yet."
+    if "top_queries" in evidence_required and not (
+        "top_queries" in observation_types or "postgres_top_queries" in source_tools
+    ):
+        return False, "Top/slow query evidence has not been collected yet."
+    if "database_list" in evidence_required and not observations:
+        return False, "Database list evidence has not been collected yet."
+    missing_required = [
+        item for item in evidence_required
+        if not _required_evidence_satisfied(item, capabilities)
+    ]
+    if missing_required:
+        return False, f"Waiting for required evidence: {', '.join(missing_required)}."
+
+    return True, "Step completed against available success criteria."
 
 
 def normalize_observation(state: AgentState) -> dict[str, Any]:
@@ -346,6 +645,10 @@ def normalize_observation(state: AgentState) -> dict[str, Any]:
                 "tool_call_id": tool_call_id,
                 "duration_ms": result.get("duration_ms"),
                 "success": result.get("success"),
+                "sqlstate": result.get("sqlstate"),
+                "result_type": result.get("result_type"),
+                "row_count": result.get("row_count"),
+                "affected_rows": result.get("affected_rows"),
             },
             "created_at": _now_iso(),
         }
@@ -413,15 +716,11 @@ def verify_step(state: AgentState) -> dict[str, Any]:
     if step.get("status") in {"completed", "skipped", "failed"}:
         return {}
 
-    observations = [
-        obs for obs in state.get("db_observations", [])
-        if obs.get("step_id") == step.get("id")
-    ]
-    failed_results = [
-        result
-        for result in state.get("tool_execution_results", [])
-        if result.get("success") is False
-    ]
+    step_observations = _successful_step_observations(state, step.get("id"))
+    phase = str(step.get("phase") or "")
+    can_use_prior_evidence = phase in {"diagnose", "propose", "report"} and bool(_latest_assistant_text(state))
+    observations = step_observations or (_successful_observations(state) if can_use_prior_evidence else [])
+    failed_results = _failed_step_results(state, step.get("id"))
     policy_violation = state.get("policy_violation")
     criteria = step.get("success_criteria", [])
 
@@ -430,16 +729,40 @@ def verify_step(state: AgentState) -> dict[str, Any]:
         summary = policy_violation.get("message", "Step blocked by tool policy.")
         step["status"] = "failed"
         step["error"] = summary
-    elif failed_results:
+    elif failed_results and not observations and _recoverable_read_failure(step, failed_results):
+        repeat_count = _failure_repeat_count(state, step["id"], failed_results)
+        if repeat_count < 1:
+            repair_message = _read_failure_repair_message(step, failed_results)
+            repair_state = {**state, "messages": [*state.get("messages", []), repair_message]}
+            return {
+                "messages": [repair_message],
+                "loop_status": "running",
+                "step_context": build_step_context_packet(repair_state),
+                **StateManager(repair_state).runtime_update(last_node="verify_step"),
+                **StateValidator(repair_state).validation_update(),
+            }
+        status = "blocked"
+        summary = str(failed_results[-1].get("summary") or "Read-only diagnostic failed repeatedly.")
+        step["status"] = "failed"
+        step["error"] = summary
+    elif failed_results and not observations:
         status = "blocked"
         summary = str(failed_results[-1].get("summary") or "Tool execution failed.")
         step["status"] = "failed"
         step["error"] = summary
     else:
+        evidence_ok, evidence_summary = _step_has_expected_evidence(state, step, observations)
+        if not evidence_ok:
+            return {
+                "loop_status": "running",
+                "step_context": build_step_context_packet(state),
+                **StateManager(state).runtime_update(last_node="verify_step"),
+                **StateValidator(state).validation_update(),
+            }
         status = "passed"
-        summary = "Step completed against available success criteria."
+        summary = evidence_summary
         step["status"] = "completed"
-        step["result"] = observations[-1]["summary"] if observations else "Completed without tool evidence."
+        step["result"] = observations[-1]["summary"] if observations else _latest_assistant_text(state) or "Completed without tool evidence."
 
     steps[current_idx] = step
     result: VerificationResult = {

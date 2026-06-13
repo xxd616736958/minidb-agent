@@ -49,6 +49,8 @@ class SessionIndex:
         for record in records:
             if not include_archived and record.get("archived"):
                 continue
+            if not has_resume_content(record):
+                continue
             if project_dir and record.get("project_dir") != project_dir:
                 continue
             if database_fingerprint and record.get("database_fingerprint") != database_fingerprint:
@@ -105,15 +107,30 @@ class SessionIndex:
         return records[0] if records else None
 
 
+def has_resume_content(record: dict[str, Any]) -> bool:
+    """Return whether a record represents a real resumable conversation."""
+    title = str(record.get("title") or "").strip()
+    thread_id = str(record.get("thread_id") or "")
+    fallback = f"Session {thread_id[:8]}"
+    if record.get("last_intent"):
+        return True
+    if record.get("artifact_paths"):
+        return True
+    if str(record.get("last_status") or "unknown") != "unknown":
+        return True
+    return bool(title and title != fallback)
+
+
 def record_from_runtime(
     config: CliRuntimeConfig,
     *,
     thread_id: str,
     title: str | None = None,
     state_values: dict[str, Any] | None = None,
+    server_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     state_values = state_values or {}
-    card = build_db_connection_card(config)
+    card = build_db_connection_card(config, server_info)
     intent = state_values.get("current_intent") or {}
     packages = state_values.get("delivery_packages") or []
     artifact_paths = []

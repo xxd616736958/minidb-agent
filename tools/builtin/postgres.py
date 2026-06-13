@@ -6,7 +6,7 @@ import re
 import time
 from typing import Any, Literal, Optional, Type
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from execution.environment import build_database_environment_profile
 from tools.base import AgentTool
@@ -151,6 +151,58 @@ class PostgresSQLClassifyTool(AgentTool):
         )
 
 
+class ListDatabasesInput(BaseModel):
+    include_templates: bool = Field(default=False, description="Whether to include template databases.")
+
+
+class PostgresListDatabasesTool(AgentTool):
+    name: str = "postgres_list_databases"
+    description: str = "List visible PostgreSQL databases with owner, encoding, collation, connection allowance, and size."
+    args_schema: Type[BaseModel] = ListDatabasesInput
+    tool_domain: str = "postgresql"
+    operation_type: str = "read_only"
+    risk_level: str = "low"
+    read_only: bool = True
+    destructive: bool = False
+    requires_approval: bool = False
+    allowed_phases: list[str] = ["observe", "diagnose", "verify", "report"]
+    allowed_policies: list[str] = ["read_only_tools", "write_tools_after_approval"]
+    output_type: str = "database_list"
+    result_sensitivity: str = "internal"
+    search_hint: str | None = "list PostgreSQL databases current cluster"
+
+    def _run(self, include_templates: bool = False) -> str:
+        started = time.monotonic()
+        sql = """
+            SELECT d.datname AS database,
+                   pg_catalog.pg_get_userbyid(d.datdba) AS owner,
+                   pg_catalog.pg_encoding_to_char(d.encoding) AS encoding,
+                   d.datcollate AS collation,
+                   d.datallowconn AS allow_connections,
+                   pg_catalog.pg_size_pretty(pg_catalog.pg_database_size(d.datname)) AS size
+            FROM pg_catalog.pg_database d
+            WHERE %s OR NOT d.datistemplate
+            ORDER BY d.datistemplate, d.datname
+        """
+        try:
+            result = _driver().execute(sql, params=[include_templates], readonly=True, max_rows=200)
+            return dumps_result(
+                make_result(
+                    tool_name=self.name,
+                    success=True,
+                    result_type="database_list",
+                    summary=f"Found {result.row_count} database(s).",
+                    payload={"databases": result.rows, "include_templates": include_templates},
+                    row_count=result.row_count,
+                    duration_ms=result.duration_ms,
+                    truncated=result.truncated,
+                    sensitive_fields_masked=result.sensitive_fields_masked,
+                )
+            )
+        except Exception as exc:
+            return _error_result(self.name, "sql_error", exc, _timed_ms(started))
+
+
 class ListSchemasInput(BaseModel):
     include_system: bool = Field(default=False, description="Whether to include pg_* and information_schema schemas.")
 
@@ -177,12 +229,12 @@ class PostgresListSchemasTool(AgentTool):
                 schema_name,
                 schema_owner,
                 CASE
-                    WHEN schema_name LIKE 'pg_%' THEN 'system'
+                    WHEN starts_with(schema_name, 'pg_') THEN 'system'
                     WHEN schema_name = 'information_schema' THEN 'system'
                     ELSE 'user'
                 END AS schema_type
             FROM information_schema.schemata
-            WHERE %s OR (schema_name NOT LIKE 'pg_%%' AND schema_name <> 'information_schema')
+            WHERE %s OR (NOT starts_with(schema_name, 'pg_') AND schema_name <> 'information_schema')
             ORDER BY schema_type, schema_name
         """
         try:
@@ -206,7 +258,14 @@ class PostgresListSchemasTool(AgentTool):
 
 
 class ListObjectsInput(BaseModel):
-    schema_name: str = Field(description="Schema name to inspect.", min_length=1, max_length=256)
+    model_config = ConfigDict(populate_by_name=True)
+
+    schema_name: str = Field(
+        description="Schema name to inspect.",
+        min_length=1,
+        max_length=256,
+        validation_alias=AliasChoices("schema_name", "schema"),
+    )
     object_type: Literal["table", "view", "sequence", "extension"] = Field(default="table", description="Object type to list.")
     limit: int = Field(default=200, ge=1, le=1000, description="Maximum objects to return.")
 
@@ -275,8 +334,20 @@ class PostgresListObjectsTool(AgentTool):
 
 
 class ObjectDetailInput(BaseModel):
-    schema_name: str = Field(description="Schema name.", min_length=1, max_length=256)
-    object_name: str = Field(description="Object name.", min_length=1, max_length=256)
+    model_config = ConfigDict(populate_by_name=True)
+
+    schema_name: str = Field(
+        description="Schema name.",
+        min_length=1,
+        max_length=256,
+        validation_alias=AliasChoices("schema_name", "schema"),
+    )
+    object_name: str = Field(
+        description="Object name.",
+        min_length=1,
+        max_length=256,
+        validation_alias=AliasChoices("object_name", "name", "table"),
+    )
     object_type: Literal["table", "view", "sequence", "extension"] = Field(default="table", description="Object type.")
 
 
@@ -510,17 +581,9 @@ class PostgresExplainTool(AgentTool):
     def _run(self, sql: str, analyze: bool = False) -> str:
         started = time.monotonic()
         classification = classify_sql(sql, allow_explain_analyze=analyze)
+        requested_analyze = bool(analyze)
         if analyze:
-            return dumps_result(
-                make_result(
-                    tool_name=self.name,
-                    success=False,
-                    result_type="policy_denied",
-                    summary="EXPLAIN ANALYZE is intentionally blocked until approval plumbing supports parameter-level escalation.",
-                    payload={"classification": classification.to_dict()},
-                    duration_ms=_timed_ms(started),
-                )
-            )
+            analyze = False
         if classification.primary_type not in {"read_only", "diagnostic"}:
             return dumps_result(
                 make_result(
@@ -536,13 +599,22 @@ class PostgresExplainTool(AgentTool):
             result = _driver().execute(f"EXPLAIN (FORMAT JSON) {sql}", readonly=True, max_rows=1)
             raw_plan = result.rows[0].get("QUERY PLAN") if result.rows else None
             plan_summary = _summarize_plan(raw_plan)
+            summary = f"Plan root: {plan_summary.get('root_node_type', 'unknown')}, cost={plan_summary.get('total_cost')}."
+            if requested_analyze:
+                summary += " EXPLAIN ANALYZE was downgraded to safe EXPLAIN without execution."
             return dumps_result(
                 make_result(
                     tool_name=self.name,
                     success=True,
                     result_type="explain_plan",
-                    summary=f"Plan root: {plan_summary.get('root_node_type', 'unknown')}, cost={plan_summary.get('total_cost')}.",
-                    payload={"classification": classification.to_dict(), "plan": plan_summary, "raw_plan": raw_plan},
+                    summary=summary,
+                    payload={
+                        "classification": classification.to_dict(),
+                        "plan": plan_summary,
+                        "raw_plan": raw_plan,
+                        "analyze_requested": requested_analyze,
+                        "analyze_executed": False,
+                    },
                     row_count=result.row_count,
                     duration_ms=result.duration_ms,
                     truncated=result.truncated,
@@ -590,14 +662,58 @@ class PostgresTopQueriesTool(AgentTool):
             LIMIT %s
         """
         try:
-            result = _driver().execute(sql, params=[limit], readonly=True, max_rows=limit)
+            drv = _driver()
+            extension = drv.execute(
+                "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements') AS installed",
+                readonly=True,
+                max_rows=1,
+            )
+            installed = bool(extension.rows and extension.rows[0].get("installed"))
+            if not installed:
+                activity = drv.execute(
+                    """
+                    SELECT pid, usename, state,
+                           now() - query_start AS running_for,
+                           wait_event_type,
+                           wait_event,
+                           left(regexp_replace(query, '\\s+', ' ', 'g'), 500) AS query_preview
+                    FROM pg_stat_activity
+                    WHERE query_start IS NOT NULL
+                      AND state <> 'idle'
+                      AND pid <> pg_backend_pid()
+                    ORDER BY query_start ASC
+                    LIMIT %s
+                    """,
+                    params=[limit],
+                    readonly=True,
+                    max_rows=limit,
+                )
+                return dumps_result(
+                    make_result(
+                        tool_name=self.name,
+                        success=True,
+                        result_type="top_queries",
+                        summary="pg_stat_statements is not installed; returned current active queries only.",
+                        payload={
+                            "sort_by": sort_by,
+                            "history_available": False,
+                            "limitation": "Historical slow query statistics require the pg_stat_statements extension.",
+                            "active_queries": activity.rows,
+                        },
+                        row_count=activity.row_count,
+                        duration_ms=extension.duration_ms + activity.duration_ms,
+                        truncated=activity.truncated,
+                        sensitive_fields_masked=activity.sensitive_fields_masked,
+                    )
+                )
+            result = drv.execute(sql, params=[limit], readonly=True, max_rows=limit)
             return dumps_result(
                 make_result(
                     tool_name=self.name,
                     success=True,
                     result_type="top_queries",
                     summary=f"Collected {result.row_count} top query row(s) ordered by {sort_by}.",
-                    payload={"sort_by": sort_by, "queries": result.rows},
+                    payload={"sort_by": sort_by, "history_available": True, "queries": result.rows},
                     row_count=result.row_count,
                     duration_ms=result.duration_ms,
                     truncated=result.truncated,
@@ -1202,7 +1318,7 @@ def _maintenance_result(tool_name: str, sql: str) -> str:
         )
     classification = classify_sql(sql, allow_explain_analyze=True)
     try:
-        result = _driver().execute(sql, readonly=False, max_rows=20, statement_timeout_ms=120_000)
+        result = _driver().execute(sql, readonly=False, max_rows=20, statement_timeout_ms=120_000, autocommit=True)
         return dumps_result(
             make_result(
                 tool_name=tool_name,

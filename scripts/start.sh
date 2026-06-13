@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# zuixiaoagent — One-Click Startup Script
+# MiniDB Agent — One-Click Startup Script
 # ============================================================
 # Usage:
 #   ./scripts/start.sh              # Interactive mode
@@ -85,12 +85,13 @@ setup_env() {
         header "Setting up environment"
         cp "$PROJECT_DIR/.env.example" "$PROJECT_DIR/.env"
         warn ".env created from .env.example"
-        warn "Please edit .env and add your API keys:"
+        warn "Please edit .env and add your API key:"
         echo ""
         echo "  vim .env"
         echo ""
         echo "Required:"
-        echo "  - OPENAI_API_KEY=sk-..."
+        echo "  - DEEPSEEK_API_KEY=sk-...  # when LLM_PROVIDER=deepseek"
+        echo "  - OPENAI_API_KEY=sk-...    # when LLM_PROVIDER=openai"
         echo ""
         echo "Recommended:"
         echo "  - LANGSMITH_API_KEY=ls__..."
@@ -106,9 +107,22 @@ setup_env() {
     set +a
 
     # Check critical vars
-    if [ -z "${OPENAI_API_KEY:-}" ] || [ "$OPENAI_API_KEY" = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" ]; then
-        err "OPENAI_API_KEY not configured in .env"
-        err "Please edit .env and set a valid API key"
+    LLM_PROVIDER_VALUE="${LLM_PROVIDER:-deepseek}"
+    if [ "$LLM_PROVIDER_VALUE" = "deepseek" ]; then
+        if [ -z "${DEEPSEEK_API_KEY:-}" ] || [[ "${DEEPSEEK_API_KEY:-}" == "sk-xxxxxxxx"* ]]; then
+            err "DEEPSEEK_API_KEY not configured in .env"
+            err "Please edit .env and set a valid DeepSeek API key"
+            exit 1
+        fi
+    elif [ "$LLM_PROVIDER_VALUE" = "openai" ]; then
+        if [ -z "${OPENAI_API_KEY:-}" ] || [[ "${OPENAI_API_KEY:-}" == "sk-xxxxxxxx"* ]]; then
+            err "OPENAI_API_KEY not configured in .env"
+            err "Please edit .env and set a valid OpenAI API key"
+            exit 1
+        fi
+    else
+        err "Unsupported LLM_PROVIDER: $LLM_PROVIDER_VALUE"
+        err "Supported providers: deepseek, openai"
         exit 1
     fi
 }
@@ -127,9 +141,9 @@ start_dev() {
     source "$VENV_DIR/bin/activate"
 
     echo ""
-    echo -e "  ${CYAN}Server:${NC}   http://localhost:2024"
+    echo -e "  ${CYAN}Server:${NC}   http://127.0.0.1:2024"
     echo -e "  ${CYAN}Studio:${NC}   https://smith.langchain.com/studio/?baseUrl=http://127.0.0.1:2024"
-    echo -e "  ${CYAN}Health:${NC}  http://localhost:2024/health"
+    echo -e "  ${CYAN}Health:${NC}  http://127.0.0.1:2024/health"
     echo ""
 
     langgraph dev --host 0.0.0.0 --port 2024 --no-browser
@@ -141,7 +155,7 @@ start_cli() {
     header "Starting CLI Client"
     source "$VENV_DIR/bin/activate"
 
-    python -m cli.main "$@"
+    minidb-agent "$@"
 }
 
 # ── Run tests ────────────────────────────────────────────────
@@ -210,7 +224,7 @@ main() {
             ;;
         *)
             echo ""
-            echo "zuixiaoagent — One-Click Startup"
+            echo "MiniDB Agent — One-Click Startup"
             echo ""
             echo "Usage: $0 <command>"
             echo ""

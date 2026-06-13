@@ -181,6 +181,21 @@ def _has_current_step_approval(state: AgentState, step_id: str | None) -> bool:
     )
 
 
+def _expected_postgres_tools(expected_tools: set[str]) -> bool:
+    return bool(expected_tools & (POSTGRES_READ_ALIASES | POSTGRES_WRITE_ALIASES)) or any(
+        name.startswith("postgres_") for name in expected_tools
+    )
+
+
+def _postgres_step_context(state: AgentState, step: TaskStep, expected_tools: set[str]) -> bool:
+    intent = state.get("current_intent") or {}
+    if intent.get("domain") == "postgresql":
+        return True
+    if _expected_postgres_tools(expected_tools):
+        return True
+    return step.get("operation_type") in POSTGRES_MUTATING_OPERATION_TYPES
+
+
 def spec_allowed_for_state(spec: RegisteredToolSpec, state: AgentState) -> bool:
     if not spec.get("enabled", True):
         return False
@@ -198,6 +213,9 @@ def spec_allowed_for_state(spec: RegisteredToolSpec, state: AgentState) -> bool:
     runtime_policy = state.get("runtime_policy") or {}
 
     if policy == "no_tools":
+        return False
+    postgres_context = _postgres_step_context(state, step, expected_tools)
+    if postgres_context and capability["domain"] != "postgresql":
         return False
     is_mutating_postgres_tool = (
         capability["domain"] == "postgresql"
@@ -222,15 +240,16 @@ def spec_allowed_for_state(spec: RegisteredToolSpec, state: AgentState) -> bool:
         elif capability["domain"] == "postgresql" and not capability["read_only"] and expected_tools & POSTGRES_WRITE_ALIASES:
             pass
         else:
-            if capability["domain"] == "postgresql" or capability["risk_level"] in {"high", "critical"}:
+            if postgres_context or capability["domain"] == "postgresql" or capability["risk_level"] in {"high", "critical"}:
                 return False
 
     if policy == "read_only_tools":
         return bool(capability["read_only"])
 
     if policy == "write_tools_after_approval":
-        if capability["requires_approval"] and not _has_current_step_approval(state, step.get("id")):
-            return False
+        # Keep write-capable tools visible so the policy gate can turn the
+        # model's proposed action into an explicit approval request. This
+        # mirrors Codex/Claude: visibility is not execution permission.
         return _risk_at_most(capability["risk_level"], "critical")
 
     return True

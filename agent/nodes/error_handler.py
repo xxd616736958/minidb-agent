@@ -109,6 +109,60 @@ def _collaboration_events(error: ErrorRecord, decision: RecoveryDecision) -> lis
     return events
 
 
+def _current_step(state: AgentState) -> dict[str, Any]:
+    step_id = state.get("current_step_id")
+    for step in state.get("task_stack", []) or []:
+        if step.get("id") == step_id:
+            return step
+    return {}
+
+
+def _has_successful_read_evidence(state: AgentState) -> bool:
+    for observation in state.get("db_observations", []) or []:
+        payload = observation.get("payload") or {}
+        if payload.get("success") is not False:
+            return True
+    for result in state.get("tool_execution_results", []) or []:
+        if result.get("success") is True:
+            return True
+    return False
+
+
+def _can_deliver_report_only_after_llm_failure(state: AgentState, error: ErrorRecord) -> bool:
+    """Allow structured delivery when only the narrative report model failed.
+
+    Codex/Claude-style loops keep tool evidence and user-facing delivery
+    separate: if the database work already collected safe read-only evidence,
+    a transient model failure while writing the final prose should not erase
+    the result. This does not bypass approval because write/execute phases and
+    pending approvals are excluded.
+    """
+    if error.get("error_type") != "llm_output_error":
+        return False
+    step = _current_step(state)
+    if step.get("phase") != "report":
+        return False
+    if state.get("pending_approval") or state.get("policy_violation"):
+        return False
+    return _has_successful_read_evidence(state)
+
+
+def _mark_current_report_step_completed(state: AgentState) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    step_id = state.get("current_step_id")
+    steps = [dict(step) for step in state.get("task_stack", []) or []]
+    completed_step: dict[str, Any] | None = None
+    for index, step in enumerate(steps):
+        if step.get("id") != step_id:
+            continue
+        step["status"] = "completed"
+        step["result"] = "Report generated from structured database evidence after the narrative model timed out."
+        step["error"] = None
+        steps[index] = step
+        completed_step = step
+        break
+    return steps, completed_step
+
+
 def error_handler(state: AgentState) -> dict[str, Any]:
     """Classify the active error, select a recovery action, and update state."""
     messages = list(state.get("messages", []))
@@ -133,7 +187,33 @@ def error_handler(state: AgentState) -> dict[str, Any]:
     }
 
     action = decision.get("action")
-    if action in {"auto_retry", "rewrite_sql", "adjust_tool_args", "run_diagnostic_tool"}:
+    if _can_deliver_report_only_after_llm_failure(state, error) and action in {"ask_user", "abort_safely"}:
+        steps, completed_step = _mark_current_report_step_completed(state)
+        plan = state.get("db_task_plan")
+        if plan and completed_step:
+            plan = dict(plan)
+            plan_steps = [dict(step) for step in plan.get("steps", [])]
+            for index, step in enumerate(plan_steps):
+                if step.get("id") == completed_step.get("id"):
+                    plan_steps[index] = {**step, **completed_step}
+                    break
+            plan["steps"] = plan_steps
+            plan["status"] = "completed"
+        report = engine.error_report(
+            status="recovered",
+            summary=(
+                f"{error.get('error_type')}: {error.get('message')}. "
+                "数据库只读证据已收集完成，系统将基于结构化证据生成报告。"
+            ),
+        )
+        update["error_reports"] = [report]
+        update["retry_count"] = 0
+        update["task_stack"] = steps
+        if plan:
+            update["db_task_plan"] = plan
+        update["current_step_id"] = None
+        update["loop_status"] = "completed"
+    elif action in {"auto_retry", "rewrite_sql", "adjust_tool_args", "run_diagnostic_tool"}:
         update["retry_count"] = int(state.get("retry_count") or 0) + 1
         update["messages"] = messages + [_system_recovery_message(error, decision)]
         update["loop_status"] = "running"

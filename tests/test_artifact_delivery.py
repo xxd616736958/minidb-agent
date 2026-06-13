@@ -234,6 +234,55 @@ def test_delivery_quality_gate_blocks_missing_required_write_approval(tmp_path):
     assert "write_items_have_approval" in gate["failed_checks"]
 
 
+def test_diagnostic_only_sql_items_do_not_require_approval_package(tmp_path):
+    base = _state(tmp_path)
+    state = _state(
+        tmp_path,
+        current_intent={
+            **base["current_intent"],
+            "operation_nature": "schema_change",
+            "requires_approval": True,
+            "requires_rollback_plan": True,
+        },
+        sql_safety_reports=[
+            {
+                "id": "sql-report-readonly",
+                "sql": "EXPLAIN SELECT * FROM orders",
+                "sql_hash": "hash-readonly",
+                "classification": "read_only",
+                "risk_level": "low",
+                "allowed": True,
+                "reasons": [],
+                "created_at": "now",
+            }
+        ],
+    )
+
+    manager = DeliveryManager(state)
+    contract = manager.build_contract()
+    manifest = manager.build_manifest()
+    gate = manager.delivery_quality_gate(contract, manifest, report_paths=["/tmp/final_report.md"])
+
+    assert "approval_package" not in manifest["missing_items"]
+    assert "write_items_have_approval" not in gate["failed_checks"]
+
+    manifest_without_safety_id = {
+        **manifest,
+        "sql_items": [
+            {
+                **manifest["sql_items"][0],
+                "safety_report_id": None,
+            }
+        ],
+    }
+    gate_without_safety_id = manager.delivery_quality_gate(
+        contract,
+        manifest_without_safety_id,
+        report_paths=["/tmp/final_report.md"],
+    )
+    assert "sql_items_have_safety_metadata" not in gate_without_safety_id["failed_checks"]
+
+
 def test_final_report_node_writes_reports_and_package(tmp_path):
     update = final_report(_state(tmp_path))
 
@@ -244,6 +293,180 @@ def test_final_report_node_writes_reports_and_package(tmp_path):
     assert update["quality_gates"][0]["gate_type"] == "delivery_quality"
     assert update["artifact_records"]
     assert "final_report_shown" == update["collaboration_events"][0]["event_type"]
+
+
+def test_final_report_uses_runtime_completed_over_stale_loop_status(tmp_path):
+    state = _state(
+        tmp_path,
+        loop_status="blocked",
+        db_task_runtime={"task_status": "completed", "risk_level": "low"},
+    )
+
+    update = final_report(state)
+    package = update["delivery_packages"][0]
+    report = Path(package["user_report_path"]).read_text(encoding="utf-8")
+
+    assert package["status"] == "ready"
+    assert "Delivery status: ready" in report
+
+
+def test_final_report_treats_recovered_report_error_as_ready_delivery(tmp_path):
+    state = _state(
+        tmp_path,
+        error_reports=[
+            {
+                "id": "error-report-1",
+                "task_id": "plan-1",
+                "plan_id": "plan-1",
+                "step_id": "report-findings",
+                "status": "recovered",
+                "error_ids": ["err-1"],
+                "recovery_attempt_ids": ["attempt-1"],
+                "evidence_refs": ["obs-explain"],
+                "user_summary": "LLM report timed out; delivered from structured evidence.",
+                "next_options": ["review_final_report"],
+                "created_at": "now",
+            }
+        ],
+    )
+
+    update = final_report(state)
+    package = update["delivery_packages"][0]
+    report = Path(package["user_report_path"]).read_text(encoding="utf-8")
+
+    assert package["status"] == "ready"
+    assert "Delivery status: ready" in report
+    assert "recovered: LLM report timed out" in report
+
+
+def test_final_report_includes_top_query_findings(tmp_path):
+    state = _state(
+        tmp_path,
+        db_observations=[
+            {
+                "id": "obs-top",
+                "step_id": "collect-top-queries",
+                "type": "top_queries",
+                "source_tool": "postgres_top_queries",
+                "summary": "Collected 2 top query row(s) ordered by resources.",
+                "payload": {
+                    "sort_by": "resources",
+                    "history_available": True,
+                    "queries": [
+                        {
+                            "query_preview": "INSERT INTO big_orders_demo SELECT generate_series($1, $2)",
+                            "calls": 10,
+                            "rows": 5000000,
+                            "total_exec_time": 35158.9,
+                            "mean_exec_time": 3515.9,
+                            "shared_blks_read": 4,
+                            "temp_blks_read": 8550,
+                            "temp_blks_written": 8550,
+                        },
+                        {
+                            "query_preview": "SELECT COUNT(*) FROM big_orders_demo",
+                            "calls": 4,
+                            "rows": 4,
+                            "total_exec_time": 22737.9,
+                            "mean_exec_time": 5684.4,
+                            "shared_blks_read": 2355376,
+                            "temp_blks_read": 0,
+                            "temp_blks_written": 0,
+                        },
+                    ],
+                },
+                "created_at": "now",
+            }
+        ],
+    )
+
+    update = final_report(state)
+    report = Path(update["delivery_packages"][0]["user_report_path"]).read_text(encoding="utf-8")
+
+    assert "## 主要发现" in report
+    assert "SELECT COUNT(*) FROM big_orders_demo" in report
+    assert "Total time: 22.74s" in report
+    assert "exact full-table count pattern" in report
+
+
+def test_final_report_uses_aggregate_hint_for_grouped_top_query(tmp_path):
+    state = _state(
+        tmp_path,
+        db_observations=[
+            {
+                "id": "obs-top",
+                "step_id": "collect-top-queries",
+                "type": "top_queries",
+                "source_tool": "postgres_top_queries",
+                "summary": "Collected 1 top query row(s) ordered by resources.",
+                "payload": {
+                    "sort_by": "resources",
+                    "history_available": True,
+                    "queries": [
+                        {
+                            "query_preview": "SELECT status, COUNT(*) AS cnt, COUNT(DISTINCT user_id) FROM public.big_orders_demo GROUP BY status ORDER BY cnt DESC",
+                            "calls": 1,
+                            "rows": 5,
+                            "total_exec_time": 13430.0,
+                            "mean_exec_time": 13430.0,
+                            "shared_blks_read": 4491429,
+                            "temp_blks_read": 15439,
+                            "temp_blks_written": 15493,
+                        },
+                    ],
+                },
+                "created_at": "now",
+            }
+        ],
+    )
+
+    update = final_report(state)
+    report = Path(update["delivery_packages"][0]["user_report_path"]).read_text(encoding="utf-8")
+
+    assert "aggregate/grouping workload" in report
+    assert "temporary spill" in report
+    assert "exact full-table count pattern" not in report
+
+
+def test_final_report_filters_internal_control_messages_from_summary(tmp_path):
+    state = _state(
+        tmp_path,
+        messages=[
+            {
+                "role": "system",
+                "content": "The current report step does not allow additional tool calls. Blocked tools: postgres_query_readonly",
+            },
+            {
+                "type": "ai",
+                "content": "The current report step does not allow additional tool calls. Blocked tools: postgres_query_readonly",
+            },
+        ],
+    )
+
+    update = final_report(state)
+    report = Path(update["delivery_packages"][0]["user_report_path"]).read_text(encoding="utf-8")
+
+    assert "does not allow additional tool calls" not in report
+    assert "Blocked tools:" not in report
+
+
+def test_final_report_renders_assistant_report_as_separate_section(tmp_path):
+    state = _state(
+        tmp_path,
+        messages=[
+            {
+                "type": "ai",
+                "content": "## 性能诊断报告\n\n```sql\nSELECT COUNT(*) FROM orders;\n```\n\n- 建议先验证执行计划",
+            },
+        ],
+    )
+
+    update = final_report(state)
+    report = Path(update["delivery_packages"][0]["user_report_path"]).read_text(encoding="utf-8")
+
+    assert "## 摘要\n\nDiagnose slow orders query" in report
+    assert "## 助手结论" in report
+    assert "```sql\nSELECT COUNT(*) FROM orders;\n```" in report
 
 
 def test_context_migration_validator_and_quality_report_include_delivery(tmp_path):

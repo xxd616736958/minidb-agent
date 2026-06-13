@@ -146,9 +146,8 @@ def prompt_sql_approval(prompt: dict[str, Any]) -> dict[str, Any]:
     `sql_hash` shown here before any write operation is executed.
     """
 
-    console.clear()
     console.print()
-    table = Table(title="PostgreSQL Approval Required", border_style="red", show_header=False)
+    table = Table(title="Approval Required", border_style="red", show_header=False, padding=(0, 1))
     table.add_column(style="dim")
     table.add_column(style="cyan")
     table.add_row("Approval", str(prompt.get("approval_id") or "unknown"))
@@ -167,13 +166,12 @@ def prompt_sql_approval(prompt: dict[str, Any]) -> dict[str, Any]:
     table.add_row("SQL Preview", str(prompt.get("sql_preview") or "")[:600])
     console.print(table)
     console.print()
-    console.print("[bold]Options:[/bold]")
-    console.print("  [green][a][/green] Approve - execute the SQL matching this hash")
-    console.print("  [red][r][/red] Reject - do not execute")
-    console.print("  [yellow][e][/yellow] Edit SQL - return modified SQL for re-review")
-    console.print("  [cyan][x][/cyan] Explain more - ask agent for more evidence")
-    console.print("  [cyan][d][/cyan] Dry run more - ask agent for safer dry-run checks")
-    console.print("  [blue][o][/blue] Report only - generate report without executing")
+    console.print("[dim]Approve only if the environment, SQL hash, impact, and rollback look correct.[/dim]")
+    console.print(
+        "[bold]Options:[/bold] [green]a[/green] approve  [red]r[/red] reject  "
+        "[yellow]e[/yellow] edit  [cyan]x[/cyan] explain  [cyan]d[/cyan] dry-run more  "
+        "[blue]o[/blue] report only"
+    )
     console.print()
 
     choice = Prompt.ask("Your choice", choices=["a", "r", "e", "x", "d", "o"], default="r")

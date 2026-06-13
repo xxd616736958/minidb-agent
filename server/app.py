@@ -15,6 +15,7 @@ import os
 import platform
 import sys
 from datetime import datetime
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,17 +24,18 @@ from fastapi.responses import JSONResponse
 from server.auth import APIKeyMiddleware
 
 logger = logging.getLogger(__name__)
+SERVICE_ROOT = str(Path(__file__).resolve().parents[1])
 
 # ── App factory ──────────────────────────────────────────────
 
 def create_app() -> FastAPI:
     """Create the FastAPI application with all middleware."""
     app = FastAPI(
-        title="zuixiaoagent — Terminal Operating Agent",
+        title="MiniDB Agent — PostgreSQL Management Agent",
         description=(
-            "LangGraph-based terminal-operating programming intelligent agent. "
-            "Provides HTTP API for agent interaction with shell execution, "
-            "file operations, code search, and human-in-the-loop approval."
+            "LangGraph-based PostgreSQL management agent. Provides HTTP API "
+            "for database task understanding, planning, safe PostgreSQL tools, "
+            "human approval, verification, and artifact delivery."
         ),
         version="0.1.0",
         docs_url="/docs",
@@ -57,7 +59,7 @@ def create_app() -> FastAPI:
     async def health_check():
         return {
             "status": "healthy",
-            "service": "zuixiaoagent",
+            "service": "minidb-agent",
             "version": "0.1.0",
             "timestamp": datetime.utcnow().isoformat(),
             "python": sys.version,
@@ -74,8 +76,13 @@ def create_app() -> FastAPI:
         """Return agent configuration and tool list."""
         from tools.registry import registry
         from agent.config import get_settings
+        from execution.environment import build_database_environment_profile
 
         settings = get_settings()
+        if registry.count == 0:
+            registry.discover("tools.builtin")
+        database_environment = build_database_environment_profile()
+        target_configured = bool(os.environ.get("POSTGRES_TARGET_URL") or settings.postgres_uri)
 
         return {
             "model": settings.llm_model,
@@ -96,6 +103,16 @@ def create_app() -> FastAPI:
             },
             "auth_enabled": settings.auth_enabled,
             "langsmith_enabled": settings.langsmith_tracing,
+            "postgres": {
+                "target_configured": target_configured,
+                "credential_ref": database_environment.get("credential_ref"),
+            },
+            "database_environment": database_environment,
+            "agent": {
+                "name": "MiniDB Agent",
+                "domain": "postgresql_management",
+                "service_root": SERVICE_ROOT,
+            },
         }
 
     # ── Error handlers ───────────────────────────────────

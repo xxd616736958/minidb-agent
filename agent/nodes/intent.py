@@ -23,15 +23,36 @@ logger = logging.getLogger(__name__)
 INTENT_ANALYZER_SYSTEM_PROMPT = """\
 You are the task-understanding layer for a PostgreSQL management agent.
 
-Your job is to turn the latest user request into one JSON object that follows
-the DBTaskIntent schema. Do not execute SQL. Do not invent database names,
-table names, column names, metrics, or environments. If information is missing,
-put it in missing_slots.
+You receive a JSON context packet, not an isolated sentence. The packet
+contains the latest user message, recent conversation, configured PostgreSQL
+target, runtime policy, pending clarification, and current intent. Turn that
+context into one JSON object that follows the DBTaskIntent schema. Do not
+execute SQL. Do not invent database names, table names, column names, metrics,
+or environments. If information is truly missing, put it in missing_slots.
 
 Design principles:
 - Use coarse intent families, not fine-grained action names.
 - Allow multiple candidate_intents when the request is mixed or ambiguous.
 - Classify risk conservatively for database operations.
+- Interpret the latest message in conversation context. If it answers a
+  pending clarification, merge it into the existing intent instead of treating
+  it as a new unrelated task.
+- Prefer the configured PostgreSQL target when the user omitted environment or
+  database. Do not ask for information that already exists in the context packet.
+- For low-risk read-only or diagnostic PostgreSQL tasks, proceed with the
+  configured target and explicit assumptions. Optional scope such as target
+  object, time window, metric range, threshold, or sample SQL should not block
+  the first read-only observation unless no useful safe observation can be made.
+- Do not ask users whether PostgreSQL diagnostic sources exist, such as
+  pg_stat_statements, pg_stat_activity, schema catalogs, server version, or
+  lock views. The agent should inspect available read-only sources itself and
+  report limitations.
+- Do not ask users to choose a default diagnostic sort metric. For "slowest SQL"
+  requests, start with pg_stat_statements ordered by total time / mean time when
+  available, then explain the metric used.
+- Ask clarification only when the target connection is unavailable, mutation
+  scope is unsafe or ambiguous, a destructive operation lacks safety filters, or
+  the user's goal cannot be inferred from the conversation.
 - Documentation/report tasks should use primary_intent="documentation" unless
   they require real database evidence; then include read_only_analysis too.
 - If the task is not database-related, set domain to documentation/code/general
@@ -205,10 +226,6 @@ def _fallback_intent(user_content: str) -> DBTaskIntent:
             "database",
             "数据库",
             "sql",
-            "表",
-            "索引",
-            "慢查询",
-            "查询",
         )
     ) else "general"
 
@@ -241,6 +258,164 @@ def _fallback_intent(user_content: str) -> DBTaskIntent:
         "suggested_workflow": workflow,
         "next_action": "ask_clarification" if domain == "postgresql" else "plan",
     }
+
+
+def _configured_database_environment(state: AgentState) -> dict[str, Any]:
+    env = state.get("database_environment") or {}
+    return env if isinstance(env, dict) else {}
+
+
+def _default_environment_from_state(state: AgentState) -> str:
+    env = str(_configured_database_environment(state).get("environment_name") or "unknown").strip()
+    if env in _VALID_ENVIRONMENTS:
+        return env
+    return "unknown"
+
+
+def _default_database_from_state(state: AgentState) -> str | None:
+    database = _configured_database_environment(state).get("target_database")
+    return str(database) if database else None
+
+
+def _append_assumption(intent: DBTaskIntent, assumption: str) -> None:
+    if assumption and assumption not in intent["assumptions"]:
+        intent["assumptions"].append(assumption)
+
+
+def _remove_missing(intent: DBTaskIntent, *slots: str) -> None:
+    blocked = set(slots)
+    intent["missing_slots"] = [slot for slot in intent.get("missing_slots", []) if slot not in blocked]
+
+
+def _apply_configured_context(intent: DBTaskIntent, state: AgentState) -> None:
+    env = _default_environment_from_state(state)
+    database = _default_database_from_state(state)
+    if intent["target_environment"] == "unknown" and env != "unknown":
+        intent["target_environment"] = env  # type: ignore[typeddict-item]
+        _remove_missing(intent, "target_environment")
+        _append_assumption(intent, f"未显式指定环境，使用当前配置环境 {env}。")
+    if not intent.get("target_database") and database:
+        intent["target_database"] = database
+        _remove_missing(intent, "target_database")
+        _append_assumption(intent, f"未显式指定数据库，使用当前连接数据库 {database}。")
+
+
+def _message_role(message: Any) -> str:
+    role = getattr(message, "type", None)
+    if isinstance(message, dict):
+        role = message.get("role") or message.get("type") or role
+    if isinstance(message, HumanMessage) or role in {"human", "user"}:
+        return "user"
+    if isinstance(message, AIMessage) or role in {"ai", "assistant"}:
+        return "assistant"
+    if isinstance(message, SystemMessage) or role == "system":
+        return "system"
+    return str(role or "unknown")
+
+
+def _message_content(message: Any) -> str:
+    content = getattr(message, "content", None)
+    if content is None and isinstance(message, dict):
+        content = message.get("content")
+    if isinstance(content, list):
+        return json.dumps(content, ensure_ascii=False, default=str)
+    return str(content or "")
+
+
+def _conversation_packet(state: AgentState, latest_user_message: str) -> dict[str, Any]:
+    conversation: list[dict[str, str]] = []
+    for message in state.get("messages", [])[-10:]:
+        content = _message_content(message).strip()
+        if content:
+            conversation.append(
+                {
+                    "role": _message_role(message),
+                    "content": content[:4000],
+                }
+            )
+
+    return {
+        "latest_user_message": latest_user_message,
+        "conversation": conversation,
+        "configured_database_environment": _configured_database_environment(state),
+        "runtime_policy": state.get("runtime_policy") or {},
+        "pending_clarification": state.get("pending_clarification"),
+        "current_intent": state.get("current_intent"),
+        "confirmed_context": state.get("confirmed_context") or {},
+    }
+
+
+def _has_configured_target(state: AgentState) -> bool:
+    return _default_environment_from_state(state) != "unknown" and bool(_default_database_from_state(state))
+
+
+def _is_read_only_or_diagnostic(intent: DBTaskIntent) -> bool:
+    if intent.get("operation_nature") in {"read_only", "diagnostic"}:
+        return True
+    if intent.get("primary_intent") in {"read_only_analysis", "performance_diagnosis"}:
+        return True
+    return False
+
+
+def _relax_read_only_missing_slots(intent: DBTaskIntent, state: AgentState) -> None:
+    if intent.get("domain") != "postgresql" or not _is_read_only_or_diagnostic(intent):
+        return
+
+    removable = [
+        "target_objects",
+        "target_objects_or_sql",
+        "sql_or_symptom",
+        "time_range",
+        "metric_scope",
+        "threshold",
+        "task_scope",
+        "sort_metric",
+        "sort_by",
+        "order_by",
+        "diagnostic_source",
+        "pg_stat_statements",
+        "pg_stat_statements_enabled",
+        "pg_stat_activity",
+        "database_version",
+        "version",
+        "source",
+    ]
+    removable.extend(
+        slot
+        for slot in intent.get("missing_slots", [])
+        if any(
+            token in slot.lower()
+            for token in (
+                "pg_stat_statements",
+                "pg_stat_activity",
+                "sort",
+                "排序",
+                "扩展",
+                "extension",
+                "版本",
+                "version",
+                "来源",
+                "source",
+            )
+        )
+    )
+    if _default_environment_from_state(state) != "unknown":
+        removable.append("target_environment")
+    if _default_database_from_state(state):
+        removable.append("target_database")
+
+    before = set(intent.get("missing_slots", []))
+    _remove_missing(intent, *removable)
+    if before != set(intent.get("missing_slots", [])) and _has_configured_target(state):
+        _append_assumption(
+            intent,
+            "Using the configured PostgreSQL target and safe read-only discovery for unspecified diagnostic scope.",
+        )
+
+    if not intent.get("missing_slots"):
+        intent["requires_clarification"] = False
+        if intent.get("next_action") == "ask_clarification":
+            intent["next_action"] = "read_only_observe"
 
 
 def normalize_intent(raw_intent: dict[str, Any], user_content: str) -> DBTaskIntent:
@@ -318,10 +493,11 @@ def intent_analyzer(state: AgentState) -> dict[str, Any]:
 
     try:
         llm = create_llm_no_tools(temperature=0.0, max_tokens=1200)
+        packet = _conversation_packet(state, user_content)
         response = llm.invoke(
             [
                 SystemMessage(content=INTENT_ANALYZER_SYSTEM_PROMPT),
-                HumanMessage(content=user_content),
+                HumanMessage(content=json.dumps(packet, ensure_ascii=False, indent=2, default=str)),
             ]
         )
         raw = str(response.content) if hasattr(response, "content") else str(response)
@@ -333,6 +509,8 @@ def intent_analyzer(state: AgentState) -> dict[str, Any]:
         parsed = {}
 
     intent = normalize_intent(parsed, user_content)
+    _apply_configured_context(intent, state)
+    _relax_read_only_missing_slots(intent, state)
     explicit_memory_updates = consolidate_explicit_memory_request(state, user_content)
     feedback_updates = CollaborationManager(state).feedback_update_from_text(
         user_content,
@@ -394,10 +572,96 @@ def _looks_like_sql_mutation(text: str) -> bool:
 def _has_sql_or_symptom(intent: DBTaskIntent, text: str) -> bool:
     if intent.get("input_artifacts") or intent.get("target_objects"):
         return True
-    return bool(
-        re.search(r"\bselect\b|\bexplain\b|\bfrom\b", text, re.IGNORECASE)
-        or _contains_any(text, ("慢", "卡", "超时", "timeout", "slow"))
+    if _contains_any(
+        text,
+        (
+            "slow",
+            "latency",
+            "performance",
+            "health",
+            "locks",
+            "active queries",
+            "top queries",
+            "慢",
+            "慢查询",
+            "执行较慢",
+            "性能",
+            "健康",
+            "锁",
+            "最慢",
+        ),
+    ):
+        return True
+    return bool(re.search(r"\bselect\b|\bexplain\b|\bfrom\b", text, re.IGNORECASE))
+
+
+def _looks_like_performance_or_health_request(text: str) -> bool:
+    return _contains_any(
+        text,
+        (
+            "slow",
+            "latency",
+            "performance",
+            "pg_stat_statements",
+            "health",
+            "locks",
+            "慢",
+            "慢查询",
+            "执行较慢",
+            "性能",
+            "健康",
+            "锁",
+            "连接数",
+            "活跃查询",
+        ),
     )
+
+
+def _looks_like_read_only_discovery_request(text: str) -> bool:
+    return _contains_any(
+        text,
+        (
+            "select",
+            "explain",
+            "show",
+            "describe",
+            "schema",
+            "table",
+            "tables",
+            "index",
+            "indexes",
+            "version",
+            "databases",
+            "current database",
+            "有哪些",
+            "查看",
+            "检查",
+            "查询",
+            "列出",
+            "数据库",
+            "表",
+            "索引",
+            "版本",
+            "当前环境",
+        ),
+    )
+
+
+def _classify_unknown_read_only_request(intent: DBTaskIntent, text: str) -> None:
+    if intent.get("domain") != "postgresql" or intent.get("primary_intent") != "unknown_or_mixed":
+        return
+    if _looks_like_performance_or_health_request(text):
+        intent["primary_intent"] = "performance_diagnosis"
+        intent["candidate_intents"] = ["performance_diagnosis", "read_only_analysis"]
+        intent["operation_nature"] = "diagnostic"
+    elif _looks_like_read_only_discovery_request(text):
+        intent["primary_intent"] = "read_only_analysis"
+        intent["candidate_intents"] = ["read_only_analysis"]
+        intent["operation_nature"] = "read_only"
+    else:
+        return
+    if intent.get("risk_level") == "unknown":
+        intent["risk_level"] = "low"
 
 
 def _append_missing(intent: DBTaskIntent, slot: str) -> None:
@@ -430,6 +694,7 @@ def intent_validator(state: AgentState) -> dict[str, Any]:
     intent = dict(intent)
     _apply_safety_memories(intent, state)
     user_content = _latest_user_content(state)
+    _apply_configured_context(intent, state)
     text = " ".join(
         [
             user_content,
@@ -438,28 +703,35 @@ def intent_validator(state: AgentState) -> dict[str, Any]:
         ]
     )
     db_context = _is_database_context(intent, text)
+    _classify_unknown_read_only_request(intent, text)
 
     if intent["domain"] == "postgresql":
         if intent["target_environment"] == "unknown":
             _append_missing(intent, "target_environment")
 
-        if intent["primary_intent"] in {"unknown_or_mixed", "read_only_analysis"}:
+        if intent["primary_intent"] == "unknown_or_mixed":
             if not intent["target_objects"] and not intent["input_artifacts"]:
                 _append_missing(intent, "target_objects_or_sql")
 
         if intent["primary_intent"] == "performance_diagnosis":
             if not _has_sql_or_symptom(intent, text):
                 _append_missing(intent, "sql_or_symptom")
-            if not re.search(r"\b(select|explain)\b", text, re.IGNORECASE):
+            if not _looks_like_performance_or_health_request(text) and not re.search(r"\b(select|explain)\b", text, re.IGNORECASE):
                 _append_missing(intent, "time_range")
             if not intent["evidence_needed"]:
                 intent["evidence_needed"] = [
+                    "top_queries",
+                    "active_queries",
                     "slow_query_sample",
                     "execution_plan",
                     "schema_summary",
                     "index_summary",
                     "row_count_or_statistics",
                 ]
+            _append_assumption(
+                intent,
+                "For read-only performance diagnostics, inspect available PostgreSQL statistics first and choose safe default metrics instead of asking the user to preselect them.",
+            )
 
     if db_context and _contains_any(text, ("drop", "truncate", "删表", "删除表", "清空表", "截断")):
         intent["domain"] = "postgresql"
@@ -495,7 +767,12 @@ def intent_validator(state: AgentState) -> dict[str, Any]:
             _append_missing(intent, "target_environment")
 
     if intent["requires_rollback_plan"]:
-        _append_missing(intent, "rollback_plan")
+        _append_assumption(
+            intent,
+            "变更任务由系统生成回滚、影响和验证说明，并在执行前随审批卡一起让用户确认。",
+        )
+
+    _relax_read_only_missing_slots(intent, state)
 
     if intent["missing_slots"]:
         intent["requires_clarification"] = True
@@ -516,6 +793,8 @@ def intent_validator(state: AgentState) -> dict[str, Any]:
         "current_intent": intent,
         "selected_workflow": intent["suggested_workflow"],
     }
+    if state.get("pending_clarification") and not intent.get("requires_clarification"):
+        update["pending_clarification"] = None
     update.update(CollaborationManager(state).task_card_update(intent))
     return update
 

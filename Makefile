@@ -2,12 +2,12 @@
 
 # Default target
 help:
-	@echo "zuixiaoagent — Terminal Operating Intelligent Agent"
+	@echo "MiniDB Agent — PostgreSQL Management Agent"
 	@echo ""
 	@echo "Targets:"
 	@echo "  install     Create venv and install all dependencies"
-	@echo "  dev         Start LangGraph dev server (http://localhost:2024)"
-	@echo "  cli         Start interactive CLI client"
+	@echo "  dev         Start LangGraph dev server (http://127.0.0.1:2024)"
+	@echo "  cli         Start interactive CLI client (pass options with ARGS='...')"
 	@echo "  test        Run all tests"
 	@echo "  reset-db    Delete local SQLite databases"
 	@echo "  clean       Remove venv, caches, and data"
@@ -40,7 +40,7 @@ dev:
 	@echo "==> Starting LangGraph dev server..."
 	@mkdir -p data
 	@if [ ! -f .env ]; then cp .env.example .env; fi
-	@echo "   Server:   http://localhost:2024"
+	@echo "   Server:   http://127.0.0.1:2024"
 	@echo "   Studio:   https://smith.langchain.com/studio/?baseUrl=http://127.0.0.1:2024"
 	.venv/bin/langgraph dev --host 0.0.0.0 --port 2024 --no-browser
 
@@ -48,7 +48,8 @@ dev:
 cli:
 	@echo "==> Starting CLI client..."
 	@if [ ! -f .env ]; then cp .env.example .env; fi
-	.venv/bin/python -m cli.main
+	@if [ ! -x .venv/bin/minidb-agent ]; then .venv/bin/pip install --no-deps -e . $(if $(PIP_INDEX),-i $(PIP_INDEX),); fi
+	.venv/bin/minidb-agent $(ARGS)
 
 # ── Testing ───────────────────────────────────────────────
 test:
@@ -78,7 +79,7 @@ clean:
 docker-up:
 	@echo "==> Starting Docker Compose stack..."
 	docker compose up -d
-	@echo "   Server: http://localhost:2024"
+	@echo "   Server: http://127.0.0.1:2024"
 
 docker-down:
 	@echo "==> Stopping Docker Compose stack..."

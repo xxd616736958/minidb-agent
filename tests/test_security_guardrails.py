@@ -63,7 +63,8 @@ def test_sql_safety_report_classifies_write_and_requires_approval():
     assert report["requires_rollback_plan"] is True
 
 
-def test_security_engine_denies_unknown_environment_write_visibility():
+def test_security_engine_denies_unknown_environment_write_visibility(monkeypatch):
+    monkeypatch.delenv("POSTGRES_TARGET_ENV", raising=False)
     db_env = build_database_environment_profile("postgresql://user:secret@db.example.com/app")
     assert db_env["environment_name"] == "unknown"
     assert db_env["allow_write_tools"] is False
@@ -269,3 +270,4 @@ def test_tool_policy_gate_creates_pending_approval_for_write_call():
     assert update["pending_approval"]["status"] == "pending"
     assert update["pending_approval"]["sql_hash"] == update["sql_safety_reports"][0]["sql_hash"]
     assert update["loop_status"] == "waiting_for_approval"
+    assert msg.tool_calls

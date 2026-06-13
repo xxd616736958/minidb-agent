@@ -125,12 +125,74 @@ def build_blocked_actions(policy: str, constraints: list[str]) -> list[str]:
 
 
 def build_missing_context(step: TaskStep, observations: list[DBObservation]) -> list[str]:
-    available = {obs.get("type") for obs in observations}
+    available = _evidence_capabilities(observations)
     missing = []
     for item in step.get("evidence_required", []):
-        if item not in available:
+        if not _evidence_satisfied(str(item), available):
             missing.append(str(item))
     return missing
+
+
+def _evidence_capabilities(observations: list[DBObservation]) -> set[str]:
+    capabilities: set[str] = set()
+    for obs in observations:
+        obs_type = str(obs.get("type") or "")
+        source_tool = str(obs.get("source_tool") or "")
+        payload = obs.get("payload") or {}
+        capabilities.add(obs_type)
+        capabilities.add(source_tool)
+        if obs_type == "explain_plan" or source_tool == "postgres_explain" or payload.get("plan"):
+            capabilities.add("execution_plan")
+        if obs_type in {"schema_summary", "object_detail"} or source_tool in {
+            "postgres_object_detail",
+            "postgres_list_objects",
+            "postgres_list_schemas",
+        }:
+            capabilities.add("schema_summary")
+        if obs_type in {"index_summary", "object_detail"} or source_tool in {
+            "postgres_object_detail",
+            "postgres_index_advisor",
+            "postgres_hypothetical_index_test",
+        }:
+            capabilities.add("index_summary")
+        if source_tool == "postgres_top_queries" or obs_type == "top_queries":
+            capabilities.add("top_queries")
+        if obs_type == "connection_status" or source_tool == "postgres_connection_check":
+            capabilities.add("connection_status")
+        if obs_type == "query_result" or source_tool == "postgres_query_readonly":
+            capabilities.add("query_result")
+            if payload.get("rows"):
+                capabilities.add("row_count_or_statistics")
+                capabilities.add("statistics")
+    return capabilities
+
+
+def _evidence_satisfied(required: str, capabilities: set[str]) -> bool:
+    key = str(required or "")
+    if key in capabilities:
+        return True
+    lowered = key.lower()
+    if any(token in lowered for token in ("pg_stat", "top sql", "top query", "slow query", "高成本", "慢 sql", "慢查询")):
+        return bool({"top_queries", "postgres_top_queries"} & capabilities)
+    if "explain" in lowered or "执行计划" in key:
+        return bool({"execution_plan", "explain_plan", "postgres_explain"} & capabilities)
+    if any(token in lowered for token in ("schema", "ddl", "metadata")) or any(token in key for token in ("表结构", "元数据", "列定义")):
+        return bool({"schema_summary", "object_detail", "postgres_object_detail", "postgres_list_objects"} & capabilities)
+    if "index" in lowered or "索引" in key:
+        return bool({"index_summary", "object_detail", "postgres_object_detail", "postgres_index_advisor"} & capabilities)
+    if any(token in lowered for token in ("row count", "statistics", "statistic")) or any(token in key for token in ("行数", "统计")):
+        return bool({"row_count_or_statistics", "statistics", "query_result", "postgres_query_readonly"} & capabilities)
+    aliases = {
+        "execution_plan": {"execution_plan", "explain_plan", "postgres_explain"},
+        "schema_summary": {"schema_summary", "object_detail", "postgres_object_detail", "postgres_list_objects"},
+        "index_summary": {"index_summary", "object_detail", "postgres_object_detail", "postgres_index_advisor"},
+        "row_count_or_statistics": {"row_count_or_statistics", "statistics", "query_result", "postgres_query_readonly"},
+        "active_queries": {"top_queries", "postgres_top_queries", "query_result", "postgres_query_readonly"},
+        "slow_query_sample": {"top_queries", "postgres_top_queries", "query_result", "postgres_query_readonly"},
+        "top_queries": {"top_queries", "postgres_top_queries"},
+        "connection_info": {"connection_status", "postgres_connection_check"},
+    }
+    return bool(aliases.get(key, set()) & capabilities)
 
 
 def build_step_context_packet(state: AgentState) -> StepContextPacket | None:

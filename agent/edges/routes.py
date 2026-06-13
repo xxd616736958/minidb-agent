@@ -11,12 +11,14 @@ import logging
 from typing import Literal
 
 from agent.state import AgentState
+from tools.policy import tool_call_items
 
 logger = logging.getLogger(__name__)
 
 # ── Node name constants ───────────────────────────────────────
 
 INTENT_ANALYZER = "intent_analyzer"
+APPROVAL_RESPONSE = "approval_response"
 INTENT_VALIDATOR = "intent_validator"
 CLARIFICATION_GATE = "clarification_gate"
 WORKFLOW_PLANNER = "workflow_planner"
@@ -38,7 +40,7 @@ END = "__end__"
 
 def route_after_start(
     state: AgentState,
-) -> Literal["intent_analyzer", "human_approval"]:
+) -> Literal["approval_response", "intent_analyzer", "human_approval"]:
     """Route from START through task understanding before planning.
 
     Resuming human approval still goes directly to the approval node.
@@ -46,7 +48,20 @@ def route_after_start(
     # Check if we're resuming from a breakpoint
     if state.get("human_interrupt_pending"):
         return HUMAN_APPROVAL
+    if state.get("cli_approval_response") and state.get("pending_approval"):
+        return APPROVAL_RESPONSE
     return INTENT_ANALYZER
+
+
+def route_after_approval_response(
+    state: AgentState,
+) -> Literal["human_approval", "task_planner", "error_handler"]:
+    """After a CLI approval response, continue or replan."""
+    if state.get("error"):
+        return ERROR_HANDLER
+    if state.get("replan_trigger") == "approval_response":
+        return TASK_PLANNER
+    return HUMAN_APPROVAL
 
 
 def route_after_intent_analyzer(
@@ -153,7 +168,7 @@ def route_after_llm(
         return FINAL_REPORT
 
     last_msg = messages[-1]
-    tool_calls = getattr(last_msg, "tool_calls", None)
+    tool_calls = tool_call_items(last_msg)
     if tool_calls:
         logger.debug(f"LLM produced {len(tool_calls)} tool call(s) → tool_policy_gate")
         return TOOL_POLICY_GATE
@@ -198,7 +213,7 @@ def route_after_approval(
         return END
 
     last_msg = messages[-1]
-    tool_calls = getattr(last_msg, "tool_calls", None)
+    tool_calls = tool_call_items(last_msg)
 
     if tool_calls:
         logger.debug(f"Approval passed → executing {len(tool_calls)} tool call(s)")

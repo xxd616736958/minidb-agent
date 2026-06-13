@@ -152,6 +152,58 @@ def test_error_handler_generates_error_report_for_permission_error():
     assert update["loop_status"] == "blocked"
 
 
+def test_error_handler_delivers_report_only_when_report_llm_times_out_after_evidence():
+    report_step = _step(
+        "report-findings",
+        phase="report",
+        status="running",
+        expected_tools=[],
+        tool_policy="no_tools",
+    )
+    state = _state(
+        task_stack=[report_step],
+        current_step_id="report-findings",
+        current_task_index=0,
+        db_task_plan={
+            **_state()["db_task_plan"],
+            "steps": [report_step],
+            "status": "running",
+        },
+        db_observations=[
+            {
+                "id": "obs-top",
+                "step_id": "observe",
+                "type": "top_queries",
+                "source_tool": "postgres_top_queries",
+                "summary": "Collected 10 top query row(s) ordered by resources.",
+                "payload": {"success": True, "queries": [{"query_preview": "SELECT COUNT(*) FROM big_orders_demo"}]},
+                "created_at": "now",
+            }
+        ],
+        error="LLM call failed: Request timed out.",
+        retry_budgets=[
+            {
+                "scope_key": "report-findings|none|llm_output_error|none",
+                "step_id": "report-findings",
+                "tool_name": None,
+                "error_type": "llm_output_error",
+                "sql_hash": None,
+                "attempts": 1,
+                "max_attempts": 1,
+                "exhausted": False,
+                "last_error_id": "err-previous",
+            }
+        ],
+    )
+
+    update = error_handler(state)
+
+    assert update["loop_status"] == "completed"
+    assert update["current_step_id"] is None
+    assert update["task_stack"][0]["status"] == "completed"
+    assert update["error_reports"][0]["status"] == "recovered"
+
+
 def test_verify_step_blocks_failed_tool_result_and_creates_recovery_decision():
     failed_result = {
         "tool_call_id": "call-1",
@@ -168,7 +220,23 @@ def test_verify_step_blocks_failed_tool_result_and_creates_recovery_decision():
         "sensitive_fields_masked": [],
     }
 
-    update = verify_step(_state(tool_execution_results=[failed_result]))
+    update = verify_step(
+        _state(
+            db_observations=[
+                {
+                    "id": "obs-failed",
+                    "step_id": "observe",
+                    "type": "sql_error",
+                    "source_tool": "postgres_query_readonly",
+                    "summary": "syntax error at or near FROM",
+                    "payload": {"success": False, "sqlstate": "42601"},
+                    "created_at": "now",
+                }
+            ],
+            tool_execution_results=[failed_result],
+            tool_invocation_records=[{"call_id": "call-1", "step_id": "observe"}],
+        )
+    )
 
     assert update["task_stack"][0]["status"] == "failed"
     assert update["error_records"][0]["error_type"] == "syntax_error"

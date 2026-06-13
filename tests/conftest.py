@@ -19,3 +19,19 @@ def temp_workspace(tmp_path):
     os.chdir(workspace)
     yield workspace
     os.chdir(original_cwd)
+
+
+@pytest.fixture(autouse=True)
+def isolate_global_memory_store():
+    """Keep persistent user memories from leaking into deterministic tests."""
+
+    try:
+        from memory.store import get_memory_store
+
+        store = get_memory_store()
+        original_records = dict(store.records)
+        store.records.clear()
+        yield
+        store.records = original_records
+    except Exception:
+        yield

@@ -9,8 +9,12 @@ This node:
 
 from __future__ import annotations
 
+import html
+import json
 import logging
+import re
 import time
+import uuid
 from typing import Any
 
 from langchain_core.messages import AIMessage, SystemMessage
@@ -32,33 +36,60 @@ from tools.registry import registry
 
 logger = logging.getLogger(__name__)
 
+_TOOL_CALL_BLOCK_RE = re.compile(r"<[^>]*tool_calls[^>]*>(?P<body>.*?)</[^>]*tool_calls[^>]*>", re.DOTALL)
+_TOOL_INVOKE_RE = re.compile(r"<[^>]*invoke\s+name=\"(?P<name>[^\"]+)\"[^>]*>(?P<body>.*?)</[^>]*invoke[^>]*>", re.DOTALL)
+_TOOL_PARAM_RE = re.compile(r"<[^>]*parameter\s+name=\"(?P<name>[^\"]+)\"[^>]*>(?P<value>.*?)</[^>]*parameter[^>]*>", re.DOTALL)
+
+_TOOL_ARG_ALIASES: dict[str, dict[str, str]] = {
+    "postgres_list_objects": {"schema": "schema_name"},
+    "postgres_object_detail": {"schema": "schema_name", "name": "object_name", "table": "object_name"},
+}
+
 # ── System prompt template ───────────────────────────────────
 
 SYSTEM_PROMPT_BASE = """\
-You are a terminal-operating programming assistant with the ability to execute
-shell commands, read and write files, and search code. You help users with
-software engineering tasks by reasoning step by step and using tools when needed.
+You are MiniDB Agent, a PostgreSQL management agent that helps users safely
+understand, diagnose, plan, verify, and document PostgreSQL database work.
+Your primary job is database operations support, not generic coding chat.
+
+If the user asks who you are or what you can do, introduce yourself as MiniDB
+Agent and explain your PostgreSQL-focused capabilities. Do not claim to be a
+generic terminal programming assistant and do not mention unrelated tools such
+as weather.
 
 ## Capabilities
-- Execute shell commands to inspect the system, run code, and manage files
-- Read and write files on the local filesystem
-- Search codebases with grep-style pattern matching
-- Plan and execute multi-step engineering tasks
+- Understand ambiguous PostgreSQL management requests and ask for clarification when target database, environment, or output is missing
+- Inspect PostgreSQL schemas, objects, indexes, locks, health signals, and top queries with read-only tools
+- Classify SQL risk before execution and explain why a SQL statement is safe, risky, blocked, or approval-bound
+- Run read-only SQL, EXPLAIN, health checks, lock inspection, and index advice within configured limits
+- Draft change SQL, dry-run plans, rollback notes, verification criteria, and approval packages
+- Execute write/DDL/maintenance actions only through approved PostgreSQL tools after safety checks and human approval
+- Generate final delivery reports, audit reports, artifact manifests, SQL delivery items, and next actions
+- Use local workspace files only within the workspace provided by the CLI/session context
 
 ## Guidelines
-1. **Think before acting**: Explain your reasoning before using tools.
-2. **One step at a time**: Execute tools sequentially, checking results between steps.
-3. **Safety first**: Dangerous commands (rm, sudo, dd) will require human approval.
-4. **Be thorough**: Read files before editing them, verify after making changes.
-5. **Handle errors**: If a tool returns an error, analyze it and adjust your approach.
-6. **Summarize results**: After completing a task, clearly state what was done.
+1. **PostgreSQL first**: Prefer PostgreSQL domain tools over shell commands or ad hoc scripts.
+2. **Read before write**: Observe and diagnose before proposing changes.
+3. **Approval before mutation**: Never execute data changes, DDL, permissions, maintenance, or destructive SQL without matching approval evidence.
+4. **Bind SQL to evidence**: Use SQL hashes, safety reports, approval records, rollback notes, and verification criteria for write paths.
+5. **Respect environment**: Treat production and unknown environments conservatively.
+6. **Be explicit about limits**: If no database target is configured, say that database tools need `POSTGRES_TARGET_URL` or CLI `--database-url`.
+7. **Deliver artifacts**: End database tasks with clear findings, evidence, risks, and next steps.
+8. **Use structured tools only**: When a tool is needed, call the bound tool. Never print tool-call markup, XML, DSML, JSON tool envelopes, or internal protocol text as the user-facing answer.
+9. **Follow expected tools**: If the current step names expected PostgreSQL tools, gather that evidence before reporting the step as complete.
+10. **Prefer tool APIs over hand-written catalog SQL**: Use object/detail,
+    schema, health, top-query, explain, and index-advisor tools before writing
+    your own PostgreSQL catalog queries. If you do query statistics views
+    directly, use PostgreSQL's actual column names such as `relname` in
+    `pg_stat_user_tables` and `pg_stat_user_indexes`; do not invent aliases
+    like `tablename`.
 
 {memory_context}
 
 {database_context}
 
 ## Current Environment
-- Working directory: {cwd}
+- Workspace directory: {cwd}
 - Platform: {platform}
 """
 
@@ -67,7 +98,6 @@ software engineering tasks by reasoning step by step and using tools when needed
 
 def build_system_prompt(state: dict[str, Any]) -> str:
     """Construct the system prompt with full memory context."""
-    import os
     import platform
 
     settings = get_settings()
@@ -79,45 +109,166 @@ def build_system_prompt(state: dict[str, Any]) -> str:
     return SYSTEM_PROMPT_BASE.format(
         memory_context=memory_context,
         database_context=database_context,
-        cwd=os.getcwd(),
+        cwd=_workspace_cwd(state),
         platform=platform.platform(),
     ) + "\n" + WORKING_MEMORY_SYSTEM_PROMPT
+
+
+def _workspace_cwd(state: dict[str, Any]) -> str:
+    workspace = state.get("workspace_profile") or {}
+    return str(workspace.get("root_path") or workspace.get("default_cwd") or "unknown")
+
+
+def _message_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                value = item.get("text") or item.get("content")
+                if value:
+                    parts.append(str(value))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    return str(content or "")
+
+
+def _coerce_markup_arg(value: str) -> Any:
+    text = html.unescape(re.sub(r"<[^>]+>", "", value)).strip()
+    if not text:
+        return ""
+    lowered = text.lower()
+    if lowered in {"true", "false", "null"}:
+        return json.loads(lowered)
+    if re.fullmatch(r"-?\d+", text):
+        try:
+            return int(text)
+        except ValueError:
+            return text
+    if re.fullmatch(r"-?\d+\.\d+", text):
+        try:
+            return float(text)
+        except ValueError:
+            return text
+    if text[:1] in {"{", "["}:
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return text
+    return text
+
+
+def _parse_tool_call_markup(content: Any) -> tuple[str, list[dict[str, Any]]]:
+    """Convert provider-specific inline tool markup into LangChain tool calls.
+
+    Codex and Claude keep tool calls separate from assistant text. Some
+    OpenAI-compatible models return a DSML-style text fallback instead of native
+    tool_calls; this function normalizes that fallback at the model boundary.
+    """
+    text = _message_content_text(content)
+    if "tool_calls" not in text or "invoke" not in text:
+        return text, []
+
+    calls: list[dict[str, Any]] = []
+    for block in _TOOL_CALL_BLOCK_RE.finditer(text):
+        body = block.group("body")
+        for invoke in _TOOL_INVOKE_RE.finditer(body):
+            tool_name = html.unescape(invoke.group("name")).strip()
+            if not tool_name:
+                continue
+            aliases = _TOOL_ARG_ALIASES.get(tool_name, {})
+            args: dict[str, Any] = {}
+            for param in _TOOL_PARAM_RE.finditer(invoke.group("body")):
+                raw_name = html.unescape(param.group("name")).strip()
+                if not raw_name:
+                    continue
+                arg_name = aliases.get(raw_name, raw_name)
+                args[arg_name] = _coerce_markup_arg(param.group("value"))
+            calls.append({"name": tool_name, "args": args, "id": f"call_{uuid.uuid4().hex[:12]}"})
+
+    cleaned = _TOOL_CALL_BLOCK_RE.sub("", text).strip()
+    return cleaned, calls
+
+
+def _normalize_llm_tool_markup(response: AIMessage) -> AIMessage:
+    content, tool_calls = _parse_tool_call_markup(getattr(response, "content", ""))
+    native_tool_calls = getattr(response, "tool_calls", None) or []
+    if native_tool_calls:
+        if content == getattr(response, "content", ""):
+            return response
+        return AIMessage(
+            content=content,
+            tool_calls=native_tool_calls,
+            additional_kwargs=getattr(response, "additional_kwargs", {}) or {},
+            response_metadata=getattr(response, "response_metadata", {}) or {},
+            id=getattr(response, "id", None),
+            usage_metadata=getattr(response, "usage_metadata", None),
+        )
+    if not tool_calls:
+        return response
+    return AIMessage(
+        content=content,
+        tool_calls=tool_calls,
+        additional_kwargs=getattr(response, "additional_kwargs", {}) or {},
+        response_metadata=getattr(response, "response_metadata", {}) or {},
+        id=getattr(response, "id", None),
+        usage_metadata=getattr(response, "usage_metadata", None),
+    )
 
 
 def _sanitize_tool_call_messages(messages: list) -> list:
     """Strip orphaned tool_calls from AIMessages that have no matching ToolMessages.
 
     DeepSeek (and some OpenAI-compatible APIs) strictly require that every
-    assistant message with tool_calls is followed by tool messages responding
-    to each tool_call_id. If a previous run failed mid-execution, the checkpoint
-    may contain AIMessages with unresolved tool_calls — this function strips them.
+    assistant message with tool_calls is immediately followed by tool messages
+    responding to each tool_call_id. If a previous run failed mid-execution, or
+    recovery inserted a system message before tool results, the checkpoint may
+    contain invalid assistant/tool ordering. Strip those tool_calls at the model
+    boundary; tool execution evidence remains available in structured state.
     """
     if not messages:
         return messages
 
     cleaned = []
     for i, msg in enumerate(messages):
-        tool_calls = getattr(msg, "tool_calls", None)
+        tool_calls = msg.get("tool_calls") if isinstance(msg, dict) else getattr(msg, "tool_calls", None)
+        if not tool_calls and isinstance(msg, dict):
+            tool_calls = (msg.get("additional_kwargs") or {}).get("tool_calls")
         if not tool_calls:
             cleaned.append(msg)
             continue
 
         # Check if the following messages contain matching ToolMessages
-        tool_call_ids = {tc["id"] for tc in tool_calls if isinstance(tc, dict) and "id" in tc}
+        tool_call_ids = set()
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            call_id = tc.get("id")
+            if call_id:
+                tool_call_ids.add(str(call_id))
         if not tool_call_ids:
             cleaned.append(msg)
             continue
 
-        # Look ahead for matching tool responses
-        matched = False
-        for j in range(i + 1, min(i + 10, len(messages))):
+        # Provider protocols require the next messages to be the tool results
+        # for this assistant tool call group. Later evidence in state is not
+        # enough if another assistant/system/user message appears first.
+        remaining = set(tool_call_ids)
+        j = i + 1
+        while j < len(messages) and remaining:
             later = messages[j]
-            tc_id = getattr(later, "tool_call_id", None)
-            if tc_id and tc_id in tool_call_ids:
-                matched = True
-                break
+            tc_id = later.get("tool_call_id") if isinstance(later, dict) else getattr(later, "tool_call_id", None)
+            if not tc_id and isinstance(later, dict):
+                tc_id = later.get("id") if later.get("type") == "tool" else None
+            if tc_id and tc_id in remaining:
+                remaining.remove(tc_id)
+                j += 1
+                continue
+            break
 
-        if matched:
+        if not remaining:
             cleaned.append(msg)
         else:
             # Orphaned tool_calls — strip them via a new message
@@ -127,7 +278,10 @@ def _sanitize_tool_call_messages(messages: list) -> list:
             )
             from langchain_core.messages import AIMessage
             cleaned.append(AIMessage(
-                content=getattr(msg, "content", "") or "[Tool calls were cancelled due to a previous error]",
+                content=(
+                    (msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", ""))
+                    or "[Tool calls were cancelled due to a previous error]"
+                ),
                 tool_calls=[],
             ))
 
@@ -187,6 +341,7 @@ def llm_reason(state: AgentState) -> dict[str, Any]:
     started_at = time.monotonic()
     try:
         response = llm.invoke(messages)
+        response = _normalize_llm_tool_markup(response)
     except Exception as e:
         logger.error(f"LLM invocation failed: {e}")
         failure_update = {

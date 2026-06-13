@@ -32,7 +32,14 @@ def final_report(state: AgentState) -> dict[str, Any]:
     if _should_skip_delivery(state):
         return {}
 
-    force_blocked = state.get("loop_status") == "blocked" or bool(state.get("error_reports"))
+    runtime = state.get("db_task_runtime") or {}
+    task_status = runtime.get("task_status") or state.get("loop_status")
+    blocking_error_reports = [
+        report
+        for report in state.get("error_reports", []) or []
+        if report.get("status") in {"failed", "blocked"}
+    ]
+    force_blocked = task_status in {"blocked", "failed", "error"} or bool(blocking_error_reports)
     try:
         update = DeliveryManager(state).build_delivery_update(force_blocked=force_blocked)
     except Exception as exc:

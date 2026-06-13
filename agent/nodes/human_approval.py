@@ -21,6 +21,7 @@ from typing import Any
 
 from agent.config import get_settings
 from agent.state import AgentState
+from tools.policy import tool_call_items
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,7 @@ def human_approval(state: AgentState) -> dict[str, Any]:
         return {}
 
     last_msg = messages[-1]
-    tool_calls = getattr(last_msg, "tool_calls", None)
+    tool_calls = tool_call_items(last_msg)
     if not tool_calls:
         return {"human_interrupt_pending": False}
 
@@ -87,9 +88,14 @@ def human_approval(state: AgentState) -> dict[str, Any]:
     )
 
     # Remove dangerous tool calls from the AIMessage
-    last_msg.tool_calls = [
-        tc for tc in tool_calls if tc.get("id") in safe_ids
-    ]
+    safe_tool_calls = [tc for tc in tool_calls if tc.get("id") in safe_ids]
+    if isinstance(last_msg, dict):
+        last_msg["tool_calls"] = safe_tool_calls
+        additional = last_msg.get("additional_kwargs")
+        if isinstance(additional, dict):
+            additional.pop("tool_calls", None)
+    else:
+        last_msg.tool_calls = safe_tool_calls
 
     # Add a rejection notice
     from langchain_core.messages import ToolMessage

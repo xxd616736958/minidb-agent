@@ -1002,6 +1002,7 @@ class DatabaseEnvironmentProfile(TypedDict):
     environment_name: Literal["local", "dev", "staging", "production", "unknown"]
     target_database: Optional[str]
     safe_host_label: Optional[str]
+    safe_port: NotRequired[Optional[int]]
     safe_user_label: Optional[str]
     access_mode: Literal["read_only", "diagnostic", "write_after_approval", "admin_maintenance"]
     is_production: bool
@@ -1438,6 +1439,7 @@ class AgentState(TypedDict):
     approval_decisions: NotRequired[Annotated[list[ApprovalDecision], operator.add]]
     verification_results: NotRequired[Annotated[list[VerificationResult], operator.add]]
     pending_approval: NotRequired[Optional[ApprovalDecision]]
+    cli_approval_response: NotRequired[Optional[dict[str, Any]]]
     policy_violation: NotRequired[Optional[dict[str, Any]]]
     step_context: NotRequired[Optional[StepContextPacket]]
     db_working_set: NotRequired[Optional[DBWorkingSet]]

@@ -8,17 +8,21 @@ import json
 import logging
 import os
 import sys
+import warnings
+from pathlib import Path
 from typing import Any
+
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"langgraph\..*")
+warnings.filterwarnings("ignore", message=r"The default value of `allowed_objects`.*")
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from cli.config import build_db_connection_card, runtime_config_from_args
-from cli.display import console, print_connection_card, print_doctor_report, print_session_index
-from cli.doctor import doctor_exit_code, run_doctor
-from cli.exec_mode import run_exec
-from cli.repl import AgentRepl
+from cli.config import build_db_connection_card, persist_runtime_defaults, runtime_config_from_args
+from cli.display import console, print_doctor_report, print_session_index
+from cli.local_server import ensure_local_server
+from cli.setup_flow import ensure_database_config
 from cli.sessions import SessionIndex
 
 
@@ -58,6 +62,8 @@ Examples:
     resume_parser = subparsers.add_parser("resume", help="Resume an indexed or explicit session")
     _add_common_options(resume_parser, suppress_defaults=True)
     resume_parser.add_argument("thread_id", nargs="?", help="Thread id to resume. Defaults to latest indexed session.")
+    resume_parser.add_argument("--last", action="store_true", help="Resume latest indexed session without opening picker.")
+    resume_parser.add_argument("--all", action="store_true", help="Include archived sessions in the picker.")
 
     return parser.parse_args(argv)
 
@@ -66,8 +72,8 @@ def _add_common_options(parser: argparse.ArgumentParser, *, suppress_defaults: b
     default = argparse.SUPPRESS if suppress_defaults else None
     parser.add_argument(
         "--url",
-        default=argparse.SUPPRESS if suppress_defaults else os.environ.get("AGENT_SERVER_URL", "http://localhost:2024"),
-        help="LangGraph server URL (default: http://localhost:2024)",
+        default=argparse.SUPPRESS if suppress_defaults else os.environ.get("AGENT_SERVER_URL"),
+        help="LangGraph server URL (default: http://127.0.0.1:2024)",
     )
     parser.add_argument(
         "--api-key",
@@ -78,7 +84,7 @@ def _add_common_options(parser: argparse.ArgumentParser, *, suppress_defaults: b
     parser.add_argument("--db-profile", default=argparse.SUPPRESS if suppress_defaults else os.environ.get("POSTGRES_PROFILE"), help="Named PostgreSQL profile; credentials remain server-side")
     parser.add_argument("--target-env", default=argparse.SUPPRESS if suppress_defaults else os.environ.get("POSTGRES_TARGET_ENV", "unknown"), choices=["dev", "test", "staging", "prod", "production", "local", "unknown"], help="Target database environment")
     parser.add_argument("--readonly", action="store_true", default=default, help="Request readonly mode for this CLI session")
-    parser.add_argument("--approval-mode", choices=["auto-readonly", "on-write", "always", "never"], default=argparse.SUPPRESS if suppress_defaults else os.environ.get("MINIDB_APPROVAL_MODE", "on-write"), help="Database approval mode")
+    parser.add_argument("--approval-mode", choices=["auto-readonly", "on-write", "always", "never"], default=argparse.SUPPRESS if suppress_defaults else os.environ.get("MINIDB_APPROVAL_MODE"), help="Database approval mode")
     parser.add_argument("--workspace", default=argparse.SUPPRESS if suppress_defaults else os.environ.get("MINIDB_WORKSPACE", os.getcwd()), help="Workspace directory")
     parser.add_argument("--output", choices=["human", "json", "jsonl"], default=argparse.SUPPRESS if suppress_defaults else os.environ.get("MINIDB_OUTPUT", "human"), help="Output mode")
     parser.add_argument("--json", action="store_true", default=default, help="Alias for --output json")
@@ -88,6 +94,8 @@ def _add_common_options(parser: argparse.ArgumentParser, *, suppress_defaults: b
     parser.add_argument("--new", action="store_true", default=default, help="Force a new interactive session")
     parser.add_argument("--no-save-session", action="store_true", default=default, help="Do not update local CLI session index")
     parser.add_argument("--log-level", default=argparse.SUPPRESS if suppress_defaults else os.environ.get("AGENT_LOG_LEVEL", "WARNING"), choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging level")
+    parser.add_argument("--verbose", action="store_true", default=default, help="Show internal planning, routing, and delivery events.")
+    parser.add_argument("--no-server", action="store_true", default=default, help="Do not auto-start a local LangGraph server.")
 
 
 def setup_logging(level: str) -> None:
@@ -96,6 +104,8 @@ def setup_logging(level: str) -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 async def main(argv: list[str] | None = None) -> int:
@@ -104,9 +114,22 @@ async def main(argv: list[str] | None = None) -> int:
     setup_logging(config.log_level)
 
     if args.command == "exec":
+        from cli.exec_mode import run_exec
+
+        config = ensure_database_config(config, interactive=False)
+        persist_runtime_defaults(config)
+        if not getattr(args, "no_server", False):
+            try:
+                config = await ensure_local_server(config)
+                persist_runtime_defaults(config)
+            except Exception as exc:
+                console.print(f"[red]Cannot start local server: {exc}[/red]")
+                return 1
         return await run_exec(config, args.prompt, thread_id=getattr(args, "thread_id", None) or getattr(args, "resume", None))
 
     if args.command == "doctor":
+        from cli.doctor import doctor_exit_code, run_doctor
+
         report = await run_doctor(config, check_server=not args.skip_server, check_database=not args.skip_database)
         if config.output_mode == "human":
             print_doctor_report(report)
@@ -123,9 +146,13 @@ async def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "resume":
-        thread_id = args.thread_id or _latest_thread_id(config)
+        thread_id = args.thread_id
+        if not thread_id and getattr(args, "last", False):
+            thread_id = _latest_thread_id(config)
         if not thread_id:
-            console.print("[red]No indexed session to resume.[/red]")
+            thread_id = await _pick_thread_id(config, include_archived=bool(getattr(args, "all", False)))
+        if not thread_id:
+            console.print("[red]No session selected.[/red]")
             return 2
         args.resume = thread_id
 
@@ -133,9 +160,18 @@ async def main(argv: list[str] | None = None) -> int:
 
 
 async def _run_repl(args: argparse.Namespace, config: Any) -> int:
+    from cli.repl import AgentRepl
+
     thread_id = _select_thread_id(args, config)
-    if config.output_mode == "human":
-        print_connection_card(build_db_connection_card(config))
+    config = ensure_database_config(config, interactive=True)
+    persist_runtime_defaults(config)
+    if not getattr(args, "no_server", False):
+        try:
+            config = await ensure_local_server(config)
+            persist_runtime_defaults(config)
+        except Exception as exc:
+            console.print(f"[red]Cannot start local server: {exc}[/red]")
+            return 1
     if not await _validate_server(config):
         return 1
 
@@ -157,9 +193,9 @@ async def _run_repl(args: argparse.Namespace, config: Any) -> int:
 def _select_thread_id(args: argparse.Namespace, config: Any) -> str | None:
     if getattr(args, "resume", None):
         return args.resume
-    if getattr(args, "new", False):
-        return None
-    return _latest_thread_id(config)
+    # Match Codex/Claude session semantics: starting the CLI opens a fresh
+    # conversation unless the user explicitly resumes one.
+    return None
 
 
 def _latest_thread_id(config: Any) -> str | None:
@@ -167,8 +203,20 @@ def _latest_thread_id(config: Any) -> str | None:
     return str(record.get("thread_id")) if record else None
 
 
+async def _pick_thread_id(config: Any, *, include_archived: bool = False) -> str | None:
+    from cli.session_picker import choose_session
+
+    project_dir = str(Path(config.workspace).expanduser().resolve())
+    index = SessionIndex()
+    records = index.list(include_archived=include_archived, project_dir=project_dir, limit=30)
+    if not records:
+        records = index.list(include_archived=include_archived, limit=30)
+    return await choose_session(records)
+
+
 async def _validate_server(config: Any) -> bool:
-    console.print(f"[dim]Connecting to {config.server_url}...[/dim]")
+    if config.verbose:
+        console.print(f"[dim]Connecting to {config.server_url}...[/dim]")
     try:
         import httpx
 
@@ -176,7 +224,8 @@ async def _validate_server(config: Any) -> bool:
             api_key_header = {"X-API-Key": config.api_key} if config.api_key else {}
             resp = await client.get(f"{config.server_url}/health", headers=api_key_header)
             if resp.status_code == 200:
-                console.print("[green]✓ Server healthy[/green]")
+                if config.verbose:
+                    console.print("[green]✓ Server healthy[/green]")
                 return True
             if resp.status_code == 401:
                 console.print("[red]✗ Authentication failed - check your API key[/red]")
@@ -198,5 +247,10 @@ def _print_json(data: Any) -> None:
     print(json.dumps(data, ensure_ascii=False, default=str))
 
 
-if __name__ == "__main__":
+def sync_main() -> None:
+    """Console-script entry point."""
     sys.exit(asyncio.run(main()))
+
+
+if __name__ == "__main__":
+    sync_main()
